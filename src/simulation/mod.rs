@@ -17,8 +17,10 @@ pub mod fork_db;
 pub mod gas_estimator;
 pub mod parallel;
 pub mod revm_simulator;
+pub mod swap_simulator;
 
 pub use eth_call::EthCallSimulator;
+pub use swap_simulator::SwapSimulator;
 pub use fork_db::{CacheStats, ForkDB, SharedForkDB};
 pub use gas_estimator::GasEstimator;
 pub use parallel::{ParallelSimStats, ParallelSimulator, SimulationAggregator};

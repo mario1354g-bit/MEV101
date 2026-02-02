@@ -51,6 +51,11 @@ impl Collector for MempoolCollector {
         while let Some(tx_hash) = stream.next().await {
             count += 1;
 
+            // Log first few txs for debugging
+            if count <= 5 {
+                debug!("MempoolCollector: Received pending tx #{}: {:?}", count, tx_hash);
+            }
+
             // Sample transactions to reduce load
             if self.config.fetch_full_tx && count % sample_rate as u64 == 0 {
                 let provider = Arc::clone(&provider);
@@ -59,6 +64,7 @@ impl Collector for MempoolCollector {
                 tokio::spawn(async move {
                     match provider.get_transaction_by_hash(tx_hash).await {
                         Ok(Some(tx)) => {
+                            debug!("MempoolCollector: Sending pending tx event for {:?}", tx_hash);
                             let event = Event::PendingTx(PendingTxEvent {
                                 tx,
                                 received_at: chrono::Utc::now(),

@@ -55,7 +55,11 @@ pub async fn run_artemis(
         pairs: create_default_pairs(),
     };
 
-    let sandwich_config = SandwichStrategyConfig::default();
+    let sandwich_config = SandwichStrategyConfig {
+        rpc_url: rpc_url.clone(),
+        use_revm_simulation: true,
+        ..SandwichStrategyConfig::default()
+    };
 
     let liquidation_config = LiquidationStrategyConfig {
         rpc_url: rpc_url.clone(),

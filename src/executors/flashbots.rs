@@ -1,13 +1,15 @@
-//! Flashbots executor - submits bundles to Flashbots relay
+//! Flashbots executor - submits bundles to Flashbots relay with revm simulation
 
 use crate::artemis::{
     Action, ArbitrageAction, ExecutionResult, Executor, LiquidationAction, SandwichAction,
 };
+use crate::simulation::{RevmSimulator, RevmTransaction};
 use alloy::network::EthereumWallet;
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use async_trait::async_trait;
+use parking_lot::RwLock;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -24,10 +26,10 @@ pub mod endpoints {
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FlashbotsBundle {
-    pub txs: Vec<String>,           // Signed transactions as hex
-    pub block_number: String,       // Target block (hex)
-    pub min_timestamp: Option<u64>, // Optional min timestamp
-    pub max_timestamp: Option<u64>, // Optional max timestamp
+    pub txs: Vec<String>,
+    pub block_number: String,
+    pub min_timestamp: Option<u64>,
+    pub max_timestamp: Option<u64>,
 }
 
 /// Flashbots send bundle params
@@ -82,11 +84,13 @@ impl Default for FlashbotsExecutorConfig {
     }
 }
 
-/// Flashbots executor
+/// Flashbots executor with revm simulation
 pub struct FlashbotsExecutor {
     config: FlashbotsExecutorConfig,
     client: Client,
     signer: Option<PrivateKeySigner>,
+    /// REVM simulator for local simulation
+    simulator: Arc<RwLock<RevmSimulator>>,
 }
 
 impl FlashbotsExecutor {
@@ -97,45 +101,152 @@ impl FlashbotsExecutor {
             None
         };
 
+        // Initialize REVM simulator
+        let simulator = RevmSimulator::new().with_chain_id(1);
+
         Ok(Self {
             config,
             client: Client::new(),
             signer,
+            simulator: Arc::new(RwLock::new(simulator)),
         })
     }
 
-    /// Build arbitrage transaction
-    async fn build_arb_tx(&self, action: &ArbitrageAction) -> eyre::Result<Bytes> {
-        // This would build the actual transaction calldata
-        // For flash loan arb: encode flash loan callback with swap path
-        // For direct arb: encode multi-hop swap
+    /// Update simulator block environment from RPC
+    pub async fn sync_block_env(&self) -> eyre::Result<()> {
+        let provider = ProviderBuilder::new().on_http(self.config.rpc_url.parse()?);
 
-        // Placeholder - would use actual contract ABI encoding
-        let calldata = Bytes::new();
-        Ok(calldata)
+        let block_number = provider.get_block_number().await?;
+        let block = provider
+            .get_block_by_number(
+                alloy::eips::BlockNumberOrTag::Number(block_number),
+                alloy::rpc::types::BlockTransactionsKind::Hashes,
+            )
+            .await?
+            .ok_or_else(|| eyre::eyre!("Block not found"))?;
+
+        let base_fee = block
+            .header
+            .base_fee_per_gas
+            .map(U256::from)
+            .unwrap_or(U256::from(30_000_000_000u64));
+
+        let mut sim = self.simulator.write();
+        sim.set_block_env(block_number, block.header.timestamp, base_fee);
+
+        debug!(
+            block = block_number,
+            base_fee = %base_fee,
+            "Synced REVM block environment"
+        );
+
+        Ok(())
     }
 
-    /// Build sandwich bundle (frontrun + backrun)
-    async fn build_sandwich_bundle(
+    /// Build arbitrage transaction for simulation
+    fn build_arb_tx_for_sim(&self, action: &ArbitrageAction) -> RevmTransaction {
+        let caller = self
+            .signer
+            .as_ref()
+            .map(|s| s.address())
+            .unwrap_or(Address::ZERO);
+
+        // Build calldata for flash loan arbitrage
+        // This would encode: executeArbitrage(path, amounts, minProfit)
+        let calldata = Bytes::new(); // Placeholder - would use actual encoding
+
+        RevmTransaction::new(caller, self.config.flashloan_contract, calldata)
+            .with_gas_limit(500_000)
+            .with_value(U256::ZERO)
+    }
+
+    /// Build sandwich transactions for simulation
+    fn build_sandwich_txs_for_sim(
         &self,
         action: &SandwichAction,
-    ) -> eyre::Result<Vec<Bytes>> {
-        // Build frontrun tx
-        let frontrun = Bytes::new(); // Would encode actual swap
+    ) -> (RevmTransaction, RevmTransaction) {
+        let caller = self
+            .signer
+            .as_ref()
+            .map(|s| s.address())
+            .unwrap_or(Address::ZERO);
 
-        // Victim tx is included by reference (target_tx)
+        // Frontrun: buy tokens before victim
+        let frontrun = RevmTransaction::new(
+            caller,
+            action.frontrun.pool,
+            Bytes::new(), // Would encode swap
+        )
+        .with_gas_limit(300_000)
+        .with_value(U256::ZERO);
 
-        // Build backrun tx
-        let backrun = Bytes::new(); // Would encode reverse swap
+        // Backrun: sell tokens after victim
+        let backrun = RevmTransaction::new(
+            caller,
+            action.backrun.pool,
+            Bytes::new(), // Would encode reverse swap
+        )
+        .with_gas_limit(300_000)
+        .with_value(U256::ZERO);
 
-        Ok(vec![frontrun, backrun])
+        (frontrun, backrun)
     }
 
-    /// Build liquidation transaction
-    async fn build_liquidation_tx(&self, action: &LiquidationAction) -> eyre::Result<Bytes> {
-        // Would encode: flash loan -> liquidate -> swap collateral -> repay
+    /// Build liquidation transaction for simulation
+    fn build_liquidation_tx_for_sim(&self, action: &LiquidationAction) -> RevmTransaction {
+        let caller = self
+            .signer
+            .as_ref()
+            .map(|s| s.address())
+            .unwrap_or(Address::ZERO);
+
+        // Would encode: executeLiquidation(protocol, user, collateral, debt, amount)
         let calldata = Bytes::new();
-        Ok(calldata)
+
+        RevmTransaction::new(caller, self.config.flashloan_contract, calldata)
+            .with_gas_limit(800_000)
+            .with_value(U256::ZERO)
+    }
+
+    /// Simulate a bundle using REVM
+    fn simulate_bundle_revm(&self, txs: &[RevmTransaction]) -> eyre::Result<(bool, u64, U256)> {
+        let mut sim = self.simulator.write();
+
+        // Create checkpoint for rollback
+        let checkpoint = sim.checkpoint();
+
+        let mut total_gas = 0u64;
+        let mut all_success = true;
+
+        for tx in txs {
+            match sim.simulate_tx(tx) {
+                Ok(result) => {
+                    total_gas += result.gas_used;
+                    if !result.success {
+                        all_success = false;
+                        warn!("Transaction in bundle reverted");
+                        break;
+                    }
+                }
+                Err(e) => {
+                    all_success = false;
+                    warn!("Simulation error: {}", e);
+                    break;
+                }
+            }
+        }
+
+        // Rollback state
+        sim.rollback_to(checkpoint);
+
+        // Estimate profit (simplified - would need actual balance tracking)
+        let estimated_profit = if all_success {
+            U256::from(total_gas) * U256::from(1_000_000_000u64) // Rough estimate
+        } else {
+            U256::ZERO
+        };
+
+        Ok((all_success, total_gas, estimated_profit))
     }
 
     /// Submit bundle to Flashbots relay
@@ -176,13 +287,6 @@ impl FlashbotsExecutor {
             .result
             .ok_or_else(|| eyre::eyre!("No result in Flashbots response"))
     }
-
-    /// Simulate bundle
-    async fn simulate_bundle(&self, txs: Vec<String>, block: u64) -> eyre::Result<u64> {
-        // Would call eth_callBundle to simulate
-        // Returns estimated gas used
-        Ok(200_000) // Placeholder
-    }
 }
 
 #[async_trait]
@@ -192,7 +296,6 @@ impl Executor for FlashbotsExecutor {
     }
 
     fn supports(&self, action: &Action) -> bool {
-        // Supports all action types
         matches!(
             action,
             Action::Arbitrage(_) | Action::Sandwich(_) | Action::Liquidation(_) | Action::Backrun(_)
@@ -200,76 +303,98 @@ impl Executor for FlashbotsExecutor {
     }
 
     async fn simulate(&self, action: &Action) -> eyre::Result<ExecutionResult> {
-        let (action_id, gas_estimate, profit) = match action {
+        // Sync block environment before simulation
+        if let Err(e) = self.sync_block_env().await {
+            warn!("Failed to sync block env: {}", e);
+        }
+
+        let (action_id, txs, expected_profit) = match action {
             Action::Arbitrage(arb) => {
-                let tx = self.build_arb_tx(arb).await?;
-                let gas = self.simulate_bundle(vec![hex::encode(&tx)], 0).await?;
-                (arb.id.clone(), gas, arb.expected_profit)
+                let tx = self.build_arb_tx_for_sim(arb);
+                (arb.id.clone(), vec![tx], arb.expected_profit)
             }
             Action::Sandwich(sandwich) => {
-                let txs = self.build_sandwich_bundle(sandwich).await?;
-                let tx_hexes: Vec<String> = txs.iter().map(|t| hex::encode(t)).collect();
-                let gas = self.simulate_bundle(tx_hexes, 0).await?;
-                (sandwich.id.clone(), gas, sandwich.expected_profit)
+                let (frontrun, backrun) = self.build_sandwich_txs_for_sim(sandwich);
+                (
+                    sandwich.id.clone(),
+                    vec![frontrun, backrun],
+                    sandwich.expected_profit,
+                )
             }
             Action::Liquidation(liq) => {
-                let tx = self.build_liquidation_tx(liq).await?;
-                let gas = self.simulate_bundle(vec![hex::encode(&tx)], 0).await?;
-                (liq.id.clone(), gas, liq.expected_profit)
+                let tx = self.build_liquidation_tx_for_sim(liq);
+                (liq.id.clone(), vec![tx], liq.expected_profit)
             }
             Action::Backrun(backrun) => {
-                let tx = self.build_arb_tx(&backrun.arb).await?;
-                let gas = self.simulate_bundle(vec![hex::encode(&tx)], 0).await?;
-                (backrun.id.clone(), gas, backrun.arb.expected_profit)
+                let tx = self.build_arb_tx_for_sim(&backrun.arb);
+                (backrun.id.clone(), vec![tx], backrun.arb.expected_profit)
             }
         };
 
-        Ok(ExecutionResult::Simulated {
-            action_id,
-            would_profit: profit,
-            gas_estimate,
-        })
+        // Run REVM simulation
+        let (success, gas_used, sim_profit) = self.simulate_bundle_revm(&txs)?;
+
+        if success {
+            info!(
+                action = %action_id,
+                gas_used = gas_used,
+                expected_profit = %expected_profit,
+                "REVM simulation successful"
+            );
+
+            Ok(ExecutionResult::Simulated {
+                action_id,
+                would_profit: expected_profit,
+                gas_estimate: gas_used,
+            })
+        } else {
+            Ok(ExecutionResult::Failed {
+                action_id,
+                reason: "REVM simulation reverted".to_string(),
+            })
+        }
     }
 
     async fn execute(&self, action: Action) -> eyre::Result<ExecutionResult> {
-        if self.config.dry_run {
-            return self.simulate(&action).await;
+        // Always simulate first
+        let sim_result = self.simulate(&action).await?;
+
+        // Check if simulation passed
+        if let ExecutionResult::Failed { action_id, reason } = sim_result {
+            return Ok(ExecutionResult::Failed { action_id, reason });
         }
 
-        // Get current block
+        if self.config.dry_run {
+            return Ok(sim_result);
+        }
+
+        // Get current block for bundle targeting
         let provider = ProviderBuilder::new().on_http(self.config.rpc_url.parse()?);
         let current_block = provider.get_block_number().await?;
         let target_block = current_block + 1;
 
-        let (action_id, txs, profit) = match &action {
-            Action::Arbitrage(arb) => {
-                let tx = self.build_arb_tx(arb).await?;
-                (arb.id.clone(), vec![hex::encode(&tx)], arb.expected_profit)
-            }
-            Action::Sandwich(sandwich) => {
-                let bundle = self.build_sandwich_bundle(sandwich).await?;
-                let tx_hexes: Vec<String> = bundle.iter().map(|t| hex::encode(t)).collect();
-                (sandwich.id.clone(), tx_hexes, sandwich.expected_profit)
-            }
-            Action::Liquidation(liq) => {
-                let tx = self.build_liquidation_tx(liq).await?;
-                (liq.id.clone(), vec![hex::encode(&tx)], liq.expected_profit)
-            }
-            Action::Backrun(backrun) => {
-                let tx = self.build_arb_tx(&backrun.arb).await?;
-                (
-                    backrun.id.clone(),
-                    vec![hex::encode(&tx)],
-                    backrun.arb.expected_profit,
-                )
-            }
+        let (action_id, profit) = match &action {
+            Action::Arbitrage(arb) => (arb.id.clone(), arb.expected_profit),
+            Action::Sandwich(sandwich) => (sandwich.id.clone(), sandwich.expected_profit),
+            Action::Liquidation(liq) => (liq.id.clone(), liq.expected_profit),
+            Action::Backrun(backrun) => (backrun.id.clone(), backrun.arb.expected_profit),
         };
 
-        info!("Submitting bundle for {}: {} txs", action_id, txs.len());
+        // Build signed transactions (placeholder - would need actual signing)
+        let signed_txs: Vec<String> = vec![];
 
-        match self.submit_bundle(txs, target_block).await {
+        info!(
+            action = %action_id,
+            target_block = target_block,
+            "Submitting bundle to Flashbots"
+        );
+
+        match self.submit_bundle(signed_txs, target_block).await {
             Ok(result) => {
-                info!("Bundle submitted: {}", result.bundle_hash);
+                info!(
+                    bundle_hash = %result.bundle_hash,
+                    "Bundle submitted successfully"
+                );
                 Ok(ExecutionResult::Success {
                     action_id,
                     tx_hash: B256::ZERO, // Bundle hash, not tx hash

@@ -2,8 +2,11 @@ mod artemis;
 mod artemis_main;
 mod collectors;
 mod config;
+mod dex;
 mod error;
 mod executors;
+mod simulation;
+mod storage;
 mod strategies;
 
 use std::sync::Arc;
@@ -219,17 +222,11 @@ async fn async_main() -> Result<(), MevError> {
         info!("Running in ARTEMIS mode (Collector -> Strategy -> Executor pipeline)");
 
         // Get WebSocket URL (prefer Alchemy for reliability)
-        let ws_url = config
-            .ethereum
-            .fallback_ws_url
-            .clone()
-            .unwrap_or_else(|| config.ethereum.ws_rpc_url.clone());
+        // Use primary WebSocket URL (Alchemy), fallback to local reth
+        let ws_url = config.ethereum.ws_rpc_url.clone();
 
-        let rpc_url = config
-            .ethereum
-            .fallback_http_url
-            .clone()
-            .unwrap_or_else(|| config.ethereum.http_rpc_url.clone());
+        // Use primary HTTP URL (Alchemy)
+        let rpc_url = config.ethereum.http_rpc_url.clone();
 
         let signer_key = config::Config::get_private_key().unwrap_or_default();
         let flashloan_contract = std::env::var("FLASHLOAN_CONTRACT")
