@@ -102,6 +102,16 @@ impl BackrunExecutor {
         }
     }
 
+    /// Returns the name of this executor.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Check if this executor can handle the given opportunity.
+    pub fn can_handle(&self, opp: &Opportunity) -> bool {
+        matches!(opp.opportunity_type, OpportunityType::Backrun)
+    }
+
     /// Extract backrun data from opportunity.
     fn extract_backrun_data(&self, opp: &Opportunity) -> Result<BackrunData> {
         let target_tx = opp.target_tx.as_ref().ok_or_else(|| {

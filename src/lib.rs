@@ -32,7 +32,10 @@ pub mod dex_types {
 // Re-export simulation types
 pub mod simulation_types {
     pub use crate::simulation::{
-        BundleSimulation, EthCallSimulator, GasEstimator, Opportunity, SimulationResult, Simulator,
+        BundleSimulation, CacheStats, EthCallSimulator, ForkDB, GasEstimator, Opportunity,
+        ParallelSimStats, ParallelSimulator, RevmSimulationResult, RevmSimulator,
+        RevmStateChange, RevmTransaction, SandwichSimResult, SharedForkDB, SimulationAggregator,
+        SimulationResult, Simulator,
     };
 }
 

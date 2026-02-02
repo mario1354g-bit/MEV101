@@ -129,6 +129,16 @@ impl SandwichExecutor {
         }
     }
 
+    /// Returns the name of this executor.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Check if this executor can handle the given opportunity.
+    pub fn can_handle(&self, opp: &Opportunity) -> bool {
+        matches!(opp.opportunity_type, OpportunityType::Sandwich)
+    }
+
     /// Extract sandwich data from opportunity.
     fn extract_sandwich_data(&self, opp: &Opportunity) -> Result<SandwichData> {
         let target_tx = opp.target_tx.as_ref().ok_or_else(|| {

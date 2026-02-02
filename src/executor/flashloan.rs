@@ -200,6 +200,16 @@ impl FlashloanExecutor {
         }
     }
 
+    /// Returns the name of this executor.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Check if this executor can handle the given opportunity.
+    pub fn can_handle(&self, opp: &Opportunity) -> bool {
+        matches!(opp.opportunity_type, OpportunityType::Arbitrage)
+    }
+
     /// Select the best flashloan provider for the given token and amount.
     fn select_provider(&self, _token: Address, chain_id: u64) -> Option<FlashloanProvider> {
         // Prefer provider with lowest fee that supports this chain

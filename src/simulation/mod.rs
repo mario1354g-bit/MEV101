@@ -1,13 +1,31 @@
 //! Simulation orchestration module for MEV bot.
 //!
 //! This module provides high-level simulation capabilities for MEV opportunities,
-//! coordinating between eth_call simulation, gas estimation, and bundle simulation.
+//! coordinating between eth_call simulation, gas estimation, REVM local simulation,
+//! and bundle simulation.
+//!
+//! ## Module Overview
+//!
+//! - `eth_call`: RPC-based simulation using eth_call
+//! - `gas_estimator`: Gas cost estimation and optimization
+//! - `revm_simulator`: Local EVM simulation using REVM
+//! - `fork_db`: Forking database for lazy state loading from RPC
+//! - `parallel`: Parallel simulation support for evaluating multiple opportunities
 
 pub mod eth_call;
+pub mod fork_db;
 pub mod gas_estimator;
+pub mod parallel;
+pub mod revm_simulator;
 
 pub use eth_call::EthCallSimulator;
+pub use fork_db::{CacheStats, ForkDB, SharedForkDB};
 pub use gas_estimator::GasEstimator;
+pub use parallel::{ParallelSimStats, ParallelSimulator, SimulationAggregator};
+pub use revm_simulator::{
+    RevmSimulator, SandwichSimResult, SimulationResult as RevmSimulationResult,
+    StateChange as RevmStateChange, Transaction as RevmTransaction,
+};
 
 use crate::dex::SwapParams;
 use crate::error::{MevError, SimulationError};
@@ -207,6 +225,11 @@ pub struct Opportunity {
 }
 
 /// Main simulator orchestrator.
+///
+/// This struct coordinates between different simulation methods:
+/// - `eth_call`: RPC-based simulation (works against live state but stateless)
+/// - `revm`: Local EVM simulation (fast, stateful, supports state persistence)
+/// - `parallel`: Parallel simulation for evaluating multiple opportunities
 pub struct Simulator<T, P>
 where
     T: Transport + Clone,
@@ -219,10 +242,16 @@ where
     gas_estimator: GasEstimator<T, P>,
     /// eth_call simulator for local simulation
     eth_call_simulator: EthCallSimulator<T, P>,
+    /// Optional REVM simulator for fast local simulation
+    revm_simulator: Option<RevmSimulator>,
+    /// Optional parallel simulator for batch evaluation
+    parallel_simulator: Option<ParallelSimulator>,
     /// Executor address (our bot's address)
     executor_address: Address,
     /// Minimum profit threshold in wei
     min_profit_wei: U256,
+    /// Whether to prefer REVM simulation when available
+    prefer_revm: bool,
     /// Phantom data for transport type
     _transport: std::marker::PhantomData<T>,
 }
@@ -245,10 +274,151 @@ where
             provider,
             gas_estimator,
             eth_call_simulator,
+            revm_simulator: None,
+            parallel_simulator: None,
             executor_address,
             min_profit_wei,
+            prefer_revm: false,
             _transport: std::marker::PhantomData,
         }
+    }
+
+    /// Create a new simulator with REVM support enabled.
+    pub fn with_revm(mut self) -> Self {
+        self.revm_simulator = Some(RevmSimulator::new());
+        self.prefer_revm = true;
+        self
+    }
+
+    /// Create a new simulator with parallel simulation support.
+    pub fn with_parallel(mut self, num_workers: Option<usize>) -> Self {
+        let workers = num_workers.unwrap_or_else(num_cpus::get);
+        self.parallel_simulator = Some(ParallelSimulator::new(workers));
+        self
+    }
+
+    /// Fork REVM state from provider at a specific block.
+    ///
+    /// This sets up the REVM simulator with block environment matching the chain state.
+    pub async fn fork_revm_from_provider(&mut self, block: Option<u64>) -> Result<(), MevError> {
+        let simulator = RevmSimulator::fork_from_provider(&*self.provider, block)
+            .await
+            .map_err(|e| SimulationError::ContractCallFailed(e.to_string()))?;
+
+        self.revm_simulator = Some(simulator);
+        self.prefer_revm = true;
+
+        info!("REVM simulator forked from provider");
+        Ok(())
+    }
+
+    /// Set the REVM simulator block environment.
+    pub fn set_revm_block_env(&mut self, block_number: u64, timestamp: u64, base_fee: U256) {
+        if let Some(ref mut revm) = self.revm_simulator {
+            revm.set_block_env(block_number, timestamp, base_fee);
+        }
+    }
+
+    /// Set an account balance in the REVM simulator (for testing).
+    pub fn set_revm_balance(&mut self, address: Address, balance: U256) {
+        if let Some(ref mut revm) = self.revm_simulator {
+            revm.set_balance(address, balance);
+        }
+    }
+
+    /// Get the REVM simulator reference.
+    pub fn revm_simulator(&self) -> Option<&RevmSimulator> {
+        self.revm_simulator.as_ref()
+    }
+
+    /// Get a mutable reference to the REVM simulator.
+    pub fn revm_simulator_mut(&mut self) -> Option<&mut RevmSimulator> {
+        self.revm_simulator.as_mut()
+    }
+
+    /// Get the parallel simulator reference.
+    pub fn parallel_simulator(&self) -> Option<&ParallelSimulator> {
+        self.parallel_simulator.as_ref()
+    }
+
+    /// Simulate a transaction using REVM.
+    ///
+    /// Returns None if REVM is not enabled.
+    pub fn simulate_tx_revm(
+        &mut self,
+        tx: &RevmTransaction,
+    ) -> Option<Result<RevmSimulationResult, MevError>> {
+        let revm = self.revm_simulator.as_mut()?;
+
+        Some(
+            revm.simulate_tx(tx)
+                .map_err(|e| SimulationError::ContractCallFailed(e.to_string()).into()),
+        )
+    }
+
+    /// Simulate a bundle using REVM with state persistence.
+    ///
+    /// Returns None if REVM is not enabled.
+    pub fn simulate_bundle_revm(
+        &mut self,
+        txs: &[RevmTransaction],
+    ) -> Option<Result<Vec<RevmSimulationResult>, MevError>> {
+        let revm = self.revm_simulator.as_mut()?;
+
+        Some(
+            revm.simulate_bundle(txs)
+                .map_err(|e| SimulationError::ContractCallFailed(e.to_string()).into()),
+        )
+    }
+
+    /// Simulate a sandwich attack using REVM.
+    ///
+    /// Returns None if REVM is not enabled.
+    pub fn simulate_sandwich_revm(
+        &mut self,
+        frontrun: &RevmTransaction,
+        victim: &RevmTransaction,
+        backrun: &RevmTransaction,
+    ) -> Option<Result<SandwichSimResult, MevError>> {
+        let revm = self.revm_simulator.as_mut()?;
+
+        Some(
+            revm.simulate_sandwich(frontrun, victim, backrun)
+                .map_err(|e| SimulationError::ContractCallFailed(e.to_string()).into()),
+        )
+    }
+
+    /// Simulate multiple transactions in parallel.
+    ///
+    /// Returns None if parallel simulator is not enabled.
+    pub fn simulate_many_parallel(
+        &self,
+        txs: Vec<RevmTransaction>,
+    ) -> Option<Vec<RevmSimulationResult>> {
+        let parallel = self.parallel_simulator.as_ref()?;
+        Some(parallel.simulate_many(txs))
+    }
+
+    /// Create a REVM checkpoint for rollback.
+    pub fn checkpoint_revm(&mut self) -> Option<usize> {
+        self.revm_simulator.as_mut().map(|r| r.checkpoint())
+    }
+
+    /// Rollback REVM to a checkpoint.
+    pub fn rollback_revm_to(&mut self, checkpoint: usize) {
+        if let Some(ref mut revm) = self.revm_simulator {
+            revm.rollback_to(checkpoint);
+        }
+    }
+
+    /// Whether REVM simulation is preferred.
+    pub fn prefers_revm(&self) -> bool {
+        self.prefer_revm && self.revm_simulator.is_some()
+    }
+
+    /// Set whether to prefer REVM simulation.
+    pub fn set_prefer_revm(&mut self, prefer: bool) {
+        self.prefer_revm = prefer;
     }
 
     /// Simulate an MEV opportunity.

@@ -234,6 +234,16 @@ impl LiquidationExecutor {
         }
     }
 
+    /// Returns the name of this executor.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Check if this executor can handle the given opportunity.
+    pub fn can_handle(&self, opp: &Opportunity) -> bool {
+        matches!(opp.opportunity_type, OpportunityType::Liquidation)
+    }
+
     /// Extract liquidation data from opportunity.
     fn extract_liquidation_data(&self, opp: &Opportunity) -> Result<LiquidationData> {
         let metadata = &opp.metadata;
