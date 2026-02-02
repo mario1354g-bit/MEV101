@@ -4,6 +4,14 @@ pragma solidity ^0.8.20;
 /**
  * @title ISwapRouter
  * @notice Interface for Uniswap V3 SwapRouter
+ *
+ * SECURITY CONSIDERATIONS:
+ * - Use amountOutMinimum for slippage protection (never set to 0 in production)
+ * - sqrtPriceLimitX96 can limit price impact (0 = no limit)
+ * - Approve exact amounts needed, reset to 0 after swaps
+ * - For non-standard tokens, reset approval to 0 before setting new value
+ * - Verify router address is legitimate before interaction
+ * - deadline parameter removed in newer versions - use block.timestamp
  */
 interface ISwapRouter {
     /**
@@ -92,6 +100,13 @@ interface ISwapRouter {
 /**
  * @title IUniswapV3Pool
  * @notice Interface for Uniswap V3 Pool
+ *
+ * SECURITY CONSIDERATIONS:
+ * - Direct pool interaction requires proper callback implementation
+ * - swap() requires uniswapV3SwapCallback implementation
+ * - flash() requires uniswapV3FlashCallback implementation
+ * - Verify pool address is legitimate (created by factory)
+ * - sqrtPriceLimitX96 prevents execution at unfavorable prices
  */
 interface IUniswapV3Pool {
     /**

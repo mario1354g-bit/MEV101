@@ -4,6 +4,9 @@ pragma solidity ^0.8.20;
 /**
  * @title IPoolAddressesProvider
  * @notice Interface for Aave V3 Pool Addresses Provider
+ *
+ * SECURITY NOTE: Use this to dynamically fetch the current Pool address
+ * rather than hardcoding, as Aave may upgrade Pool implementations.
  */
 interface IPoolAddressesProvider {
     /**
@@ -150,6 +153,16 @@ interface IFlashLoanSimpleReceiver {
 /**
  * @title IFlashLoanReceiver
  * @notice Interface for Aave V3 multi-asset flash loan receiver
+ *
+ * SECURITY IMPLEMENTATION GUIDE:
+ * 1. Validate initiator == address(this) to ensure you started the loan
+ * 2. Validate msg.sender is an approved/expected Aave Pool
+ * 3. Use a flash loan in-progress flag for additional validation
+ * 4. Approve Pool to pull repayment (amount + premium) before returning true
+ * 5. Use reentrancy guard on the initiating function
+ *
+ * WARNING: A malicious contract could call executeOperation directly.
+ * The initiator check alone is not sufficient - also validate msg.sender.
  */
 interface IFlashLoanReceiver {
     /**
@@ -160,6 +173,11 @@ interface IFlashLoanReceiver {
      * @param initiator The address that initiated the flash loan
      * @param params Arbitrary bytes passed from flash loan call
      * @return True if operation succeeded and repayment is approved
+     *
+     * SECURITY: Implementations MUST validate:
+     * - initiator is this contract (we started the flash loan)
+     * - msg.sender is an approved Aave Pool (prevents fake pool attacks)
+     * - Flash loan was expected (use in-progress flag)
      */
     function executeOperation(
         address[] calldata assets,

@@ -343,7 +343,7 @@ impl LiquidationMonitor {
         }
 
         // Build multicall for getUserAccountData
-        let selector = hex::decode("bf92857c").unwrap(); // getUserAccountData(address)
+        let selector = hex::decode("bf92857c").expect("valid hex for getUserAccountData selector");
 
         let calls: Vec<Call3> = users
             .iter()
@@ -408,7 +408,7 @@ impl LiquidationMonitor {
         }
 
         // Build multicall for isLiquidatable
-        let selector = hex::decode("17db5c02").unwrap(); // isLiquidatable(address)
+        let selector = hex::decode("17db5c02").expect("valid hex for isLiquidatable selector");
 
         let calls: Vec<Call3> = users
             .iter()
@@ -458,7 +458,7 @@ impl LiquidationMonitor {
         }
 
         // Build multicall for getAccountStatus
-        let selector = hex::decode("7de12362").unwrap(); // getAccountStatus(address)
+        let selector = hex::decode("7de12362").expect("valid hex for getAccountStatus selector");
 
         let calls: Vec<Call3> = users
             .iter()
@@ -763,7 +763,9 @@ impl LiquidationMonitor {
         event_tx: mpsc::Sender<MonitorEvent>,
         mut stop_rx: mpsc::Receiver<()>,
     ) {
-        let provider = ProviderBuilder::new().on_http(self.http_url.parse().unwrap());
+        let provider = ProviderBuilder::new().on_http(
+            self.http_url.parse().expect("http_url should be a valid URL")
+        );
 
         let poll_interval = Duration::from_millis(self.config.poll_interval_ms);
 

@@ -3,6 +3,10 @@ name = "longtail-mev-monitor"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+dashboard = ["axum", "tower-http"]
+
 [dependencies]
 alloy = { version = "0.9", features = ["full", "providers", "signers", "contract", "rpc-types", "json-rpc", "rlp", "network", "consensus", "eips", "sol-types"] }
 tokio = { version = "1", features = ["full"] }
@@ -13,8 +17,8 @@ toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
-axum = "0.8"
-tower-http = { version = "0.6", features = ["cors"] }
+axum = { version = "0.8", optional = true }
+tower-http = { version = "0.6", features = ["cors"], optional = true }
 chrono = { version = "0.4", features = ["serde"] }
 dashmap = "6"
 futures = "0.3"

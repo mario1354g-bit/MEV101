@@ -4,6 +4,7 @@
 //! for Ethereum and EVM-compatible chains.
 
 pub mod config;
+#[cfg(feature = "dashboard")]
 pub mod dashboard;
 pub mod detectors;
 pub mod dex;
@@ -14,6 +15,7 @@ pub mod simulation;
 pub mod storage;
 
 pub use config::Config;
+#[cfg(feature = "dashboard")]
 pub use dashboard::{AppState, Dashboard, DashboardError};
 pub use error::{
     ConfigError, DatabaseError, DecodingError, ExecutionError, MevError, ProviderError,

@@ -13,6 +13,20 @@ import "./interfaces/IUniswapV3.sol";
  * IMPORTANT: In production, frontrun() and backrun() are called in separate
  * transactions bundled together via Flashbots. The executeSandwich() function
  * is provided for testing/simulation purposes only.
+ *
+ * SECURITY CONSIDERATIONS:
+ * - Uses Solidity 0.8.20+ with built-in overflow/underflow protection
+ * - Implements custom reentrancy guard to prevent cross-function reentrancy
+ * - Two-step ownership transfer prevents accidental ownership loss
+ * - Router whitelist prevents arbitrary contract interactions
+ * - All external calls use safe wrappers with return value checks
+ * - Slippage protection via minAmountOut parameters
+ * - No delegatecall usage to prevent storage corruption attacks
+ *
+ * GAS OPTIMIZATIONS:
+ * - Uses unchecked increments where safe
+ * - Direct pair swaps available for maximum gas efficiency
+ * - Protocol-specific functions avoid generic overhead
  */
 contract SandwichExecutor {
     /*//////////////////////////////////////////////////////////////
@@ -27,6 +41,8 @@ contract SandwichExecutor {
     error ZeroAmount();
     error InvalidRouter();
     error SlippageExceeded();
+    error InvalidSwapData();
+    error InvalidPair();
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -78,10 +94,16 @@ contract SandwichExecutor {
     uint256 private _status;
 
     /// @notice Approved routers for swaps
+    /// @dev SECURITY: Only whitelisted routers can be used to prevent malicious contract calls
     mapping(address => bool) public approvedRouters;
+
+    /// @notice Approved pairs for direct swaps
+    /// @dev SECURITY: Only whitelisted pairs can be used for swapOnPair
+    mapping(address => bool) public approvedPairs;
 
     /// @notice Stored state between frontrun and backrun (for bundle execution)
     /// @dev tokenOut from frontrun becomes tokenIn for backrun
+    /// SECURITY NOTE: This state persists between transactions in a Flashbots bundle
     address private _pendingTokenOut;
     uint256 private _pendingAmountOut;
 
@@ -132,6 +154,12 @@ contract SandwichExecutor {
      * @param frontrunData Encoded frontrun swap data
      * @param backrunData Encoded backrun swap data
      * @return profit Net profit from sandwich
+     *
+     * SECURITY NOTES:
+     * - onlyOwner: Prevents unauthorized execution
+     * - nonReentrant: Prevents reentrancy during swaps
+     * - validRouter: Ensures router is whitelisted
+     * - minBackrunOutput: Slippage protection
      */
     function executeSandwich(
         address router,
@@ -148,6 +176,11 @@ contract SandwichExecutor {
         validRouter(router)
         returns (uint256 profit)
     {
+        // SECURITY: Validate inputs
+        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
+        if (frontrunAmount == 0) revert ZeroAmount();
+        if (frontrunData.length == 0 || backrunData.length == 0) revert InvalidSwapData();
+
         uint256 gasStart = gasleft();
         uint256 balanceBefore = _getBalance(tokenIn);
 
@@ -196,6 +229,10 @@ contract SandwichExecutor {
      * @param minAmountOut Minimum output amount
      * @param swapData Encoded swap parameters
      * @return amountOut Tokens received
+     *
+     * SECURITY NOTES:
+     * - Stores pending state for backrun correlation
+     * - minAmountOut provides slippage protection
      */
     function frontrun(
         address router,
@@ -211,7 +248,10 @@ contract SandwichExecutor {
         validRouter(router)
         returns (uint256 amountOut)
     {
+        // SECURITY: Validate inputs
+        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
         if (amountIn == 0) revert ZeroAmount();
+        if (swapData.length == 0) revert InvalidSwapData();
 
         uint256 balanceBefore = _getBalance(tokenOut);
 
@@ -234,6 +274,8 @@ contract SandwichExecutor {
      * @param amountIn Amount to swap
      * @param minAmountOut Minimum output
      * @return amountOut Tokens received
+     *
+     * GAS OPTIMIZATION: Direct V2 router call without generic overhead
      */
     function frontrunV2(
         address router,
@@ -248,9 +290,12 @@ contract SandwichExecutor {
         validRouter(router)
         returns (uint256 amountOut)
     {
+        // SECURITY: Validate inputs
+        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
         if (amountIn == 0) revert ZeroAmount();
 
-        // Approve router
+        // SECURITY: Reset and approve router (handles non-standard tokens like USDT)
+        _safeApprove(tokenIn, router, 0);
         _safeApprove(tokenIn, router, amountIn);
 
         // Build path
@@ -274,6 +319,9 @@ contract SandwichExecutor {
         _pendingTokenOut = tokenOut;
         _pendingAmountOut = _getBalance(tokenOut) - balanceBefore;
 
+        // SECURITY: Clear approval after swap
+        _safeApprove(tokenIn, router, 0);
+
         emit FrontrunExecuted(router, amountIn, amountOut);
     }
 
@@ -286,6 +334,8 @@ contract SandwichExecutor {
      * @param amountIn Amount to swap
      * @param minAmountOut Minimum output
      * @return amountOut Tokens received
+     *
+     * GAS OPTIMIZATION: Direct V3 router call without generic overhead
      */
     function frontrunV3(
         address router,
@@ -301,9 +351,12 @@ contract SandwichExecutor {
         validRouter(router)
         returns (uint256 amountOut)
     {
+        // SECURITY: Validate inputs
+        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
         if (amountIn == 0) revert ZeroAmount();
 
-        // Approve router
+        // SECURITY: Reset and approve router
+        _safeApprove(tokenIn, router, 0);
         _safeApprove(tokenIn, router, amountIn);
 
         uint256 balanceBefore = _getBalance(tokenOut);
@@ -325,6 +378,9 @@ contract SandwichExecutor {
         _pendingTokenOut = tokenOut;
         _pendingAmountOut = _getBalance(tokenOut) - balanceBefore;
 
+        // SECURITY: Clear approval after swap
+        _safeApprove(tokenIn, router, 0);
+
         emit FrontrunExecuted(router, amountIn, amountOut);
     }
 
@@ -337,6 +393,10 @@ contract SandwichExecutor {
      * @param minAmountOut Minimum output (profit + principal)
      * @param swapData Encoded swap parameters
      * @return profit Net profit from sandwich
+     *
+     * SECURITY NOTES:
+     * - Clears pending state after execution
+     * - minAmountOut protects against slippage
      */
     function backrun(
         address router,
@@ -351,6 +411,10 @@ contract SandwichExecutor {
         validRouter(router)
         returns (uint256 profit)
     {
+        // SECURITY: Validate inputs
+        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
+        if (swapData.length == 0) revert InvalidSwapData();
+
         uint256 balanceBefore = _getBalance(tokenOut);
 
         // Use all available tokenIn (output from frontrun)
@@ -379,6 +443,8 @@ contract SandwichExecutor {
      * @param tokenOut Output token (frontrun input)
      * @param minAmountOut Minimum output
      * @return profit Net profit
+     *
+     * GAS OPTIMIZATION: Direct V2 router call without generic overhead
      */
     function backrunV2(
         address router,
@@ -392,11 +458,15 @@ contract SandwichExecutor {
         validRouter(router)
         returns (uint256 profit)
     {
+        // SECURITY: Validate inputs
+        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
+
         uint256 balanceBefore = _getBalance(tokenOut);
         uint256 amountIn = _getBalance(tokenIn);
         if (amountIn == 0) revert ZeroAmount();
 
-        // Approve router
+        // SECURITY: Reset and approve router
+        _safeApprove(tokenIn, router, 0);
         _safeApprove(tokenIn, router, amountIn);
 
         // Build path
@@ -417,6 +487,9 @@ contract SandwichExecutor {
         uint256 amountOut = amounts[1];
         profit = _getBalance(tokenOut) - balanceBefore;
 
+        // SECURITY: Clear approval after swap
+        _safeApprove(tokenIn, router, 0);
+
         // Clear pending state
         _pendingTokenOut = address(0);
         _pendingAmountOut = 0;
@@ -432,6 +505,8 @@ contract SandwichExecutor {
      * @param fee Pool fee tier
      * @param minAmountOut Minimum output
      * @return profit Net profit
+     *
+     * GAS OPTIMIZATION: Direct V3 router call without generic overhead
      */
     function backrunV3(
         address router,
@@ -446,11 +521,15 @@ contract SandwichExecutor {
         validRouter(router)
         returns (uint256 profit)
     {
+        // SECURITY: Validate inputs
+        if (tokenIn == address(0) || tokenOut == address(0)) revert ZeroAddress();
+
         uint256 balanceBefore = _getBalance(tokenOut);
         uint256 amountIn = _getBalance(tokenIn);
         if (amountIn == 0) revert ZeroAmount();
 
-        // Approve router
+        // SECURITY: Reset and approve router
+        _safeApprove(tokenIn, router, 0);
         _safeApprove(tokenIn, router, amountIn);
 
         // Execute swap
@@ -467,6 +546,9 @@ contract SandwichExecutor {
 
         uint256 amountOut = ISwapRouter(router).exactInputSingle(params);
         profit = _getBalance(tokenOut) - balanceBefore;
+
+        // SECURITY: Clear approval after swap
+        _safeApprove(tokenIn, router, 0);
 
         // Clear pending state
         _pendingTokenOut = address(0);
@@ -486,6 +568,13 @@ contract SandwichExecutor {
      * @param amountIn Amount to swap
      * @param amountOut Expected output (calculated off-chain)
      * @param zeroForOne True if swapping token0 for token1
+     *
+     * GAS OPTIMIZATION: Direct pair interaction bypasses router overhead
+     *
+     * SECURITY NOTES:
+     * - Pair must be whitelisted to prevent interaction with malicious contracts
+     * - amountOut must be calculated off-chain accurately
+     * - No slippage protection built-in (amountOut is exact)
      */
     function swapOnPair(
         address pair,
@@ -494,6 +583,13 @@ contract SandwichExecutor {
         uint256 amountOut,
         bool zeroForOne
     ) external onlyOwner nonReentrant {
+        // SECURITY: Validate inputs
+        if (pair == address(0) || tokenIn == address(0)) revert ZeroAddress();
+        if (amountIn == 0 || amountOut == 0) revert ZeroAmount();
+
+        // SECURITY: Validate pair is whitelisted
+        if (!approvedPairs[pair]) revert InvalidPair();
+
         // Transfer tokens to pair
         _safeTransfer(tokenIn, pair, amountIn);
 
@@ -513,6 +609,7 @@ contract SandwichExecutor {
      * @notice Set router approval status
      * @param router Router address
      * @param approved Approval status
+     * @dev SECURITY: Only add verified, audited router contracts
      */
     function setApprovedRouter(
         address router,
@@ -521,6 +618,20 @@ contract SandwichExecutor {
         if (router == address(0)) revert ZeroAddress();
         approvedRouters[router] = approved;
         emit RouterApproved(router, approved);
+    }
+
+    /**
+     * @notice Set pair approval status for direct swaps
+     * @param pair Pair address
+     * @param approved Approval status
+     * @dev SECURITY: Only add verified Uniswap V2 compatible pair contracts
+     */
+    function setApprovedPair(
+        address pair,
+        bool approved
+    ) external onlyOwner {
+        if (pair == address(0)) revert ZeroAddress();
+        approvedPairs[pair] = approved;
     }
 
     /**
@@ -536,6 +647,24 @@ contract SandwichExecutor {
             if (routers[i] == address(0)) revert ZeroAddress();
             approvedRouters[routers[i]] = approved;
             emit RouterApproved(routers[i], approved);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @notice Batch approve multiple pairs
+     * @param pairs Array of pair addresses
+     * @param approved Approval status
+     */
+    function setApprovedPairsBatch(
+        address[] calldata pairs,
+        bool approved
+    ) external onlyOwner {
+        for (uint256 i = 0; i < pairs.length; ) {
+            if (pairs[i] == address(0)) revert ZeroAddress();
+            approvedPairs[pairs[i]] = approved;
             unchecked {
                 ++i;
             }
@@ -606,6 +735,8 @@ contract SandwichExecutor {
 
     /**
      * @notice Execute swap with raw calldata
+     * @dev SECURITY: Router must be validated before calling this function
+     *      Uses safe approve pattern to prevent approval race conditions
      */
     function _executeSwap(
         address router,
@@ -613,7 +744,8 @@ contract SandwichExecutor {
         uint256 amountIn,
         bytes calldata swapData
     ) internal returns (uint256 amountOut) {
-        // Approve router
+        // SECURITY: Reset and approve router (handles non-standard tokens)
+        _safeApprove(tokenIn, router, 0);
         _safeApprove(tokenIn, router, amountIn);
 
         // Execute swap
@@ -624,6 +756,9 @@ contract SandwichExecutor {
         if (result.length >= 32) {
             amountOut = abi.decode(result, (uint256));
         }
+
+        // SECURITY: Clear approval after swap
+        _safeApprove(tokenIn, router, 0);
     }
 
     /**

@@ -427,7 +427,10 @@ impl Detector for PriceDiscrepancyDetector {
                             }
 
                             // Get fresh data
-                            registered = ctx.pool_registry.get(pool).unwrap();
+                            registered = match ctx.pool_registry.get(pool) {
+                                Some(p) => p,
+                                None => continue, // Pool was removed
+                            };
 
                             let price_this = self.pool_price(&registered);
                             let price_other = self.pool_price(other_pool);

@@ -483,15 +483,15 @@ fn get_verified_router(protocol: &str, chain_id: u64) -> Result<RouterInfo> {
     match (protocol, chain_id) {
         // Ethereum Mainnet - verified addresses from official deployments
         ("uniswap_v2", 1) => Ok(RouterInfo {
-            address: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse().unwrap(),
+            address: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse().expect("valid Uniswap V2 router address"),
             code_hash_prefix: Some([0x41, 0x8a, 0x7b, 0x3c, 0x9d, 0x2e, 0x1f, 0x0a]),
         }),
         ("uniswap_v3", 1) => Ok(RouterInfo {
-            address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().unwrap(),
+            address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().expect("valid Uniswap V3 router address"),
             code_hash_prefix: Some([0x52, 0x9b, 0x8c, 0x4d, 0xae, 0x3f, 0x20, 0x1b]),
         }),
         ("sushiswap", 1) => Ok(RouterInfo {
-            address: "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F".parse().unwrap(),
+            address: "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F".parse().expect("valid SushiSwap router address"),
             code_hash_prefix: Some([0x63, 0xac, 0x9d, 0x5e, 0xbf, 0x40, 0x31, 0x2c]),
         }),
 
@@ -499,47 +499,47 @@ fn get_verified_router(protocol: &str, chain_id: u64) -> Result<RouterInfo> {
         ("uniswap_v2", 5) => {
             warn!("Goerli testnet is deprecated. Consider using Sepolia instead.");
             Ok(RouterInfo {
-                address: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse().unwrap(),
+                address: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse().expect("valid Uniswap V2 router address"),
                 code_hash_prefix: None,
             })
         }
         ("uniswap_v3", 5) => {
             warn!("Goerli testnet is deprecated. Consider using Sepolia instead.");
             Ok(RouterInfo {
-                address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().unwrap(),
+                address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().expect("valid Uniswap V3 router address"),
                 code_hash_prefix: None,
             })
         }
 
         // Sepolia (recommended testnet)
         ("uniswap_v2", 11155111) => Ok(RouterInfo {
-            address: "0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008".parse().unwrap(),
+            address: "0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008".parse().expect("valid Sepolia Uniswap V2 router address"),
             code_hash_prefix: None,
         }),
 
         // Polygon
         ("uniswap_v3", 137) => Ok(RouterInfo {
-            address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().unwrap(),
+            address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().expect("valid Polygon Uniswap V3 router address"),
             code_hash_prefix: Some([0x52, 0x9b, 0x8c, 0x4d, 0xae, 0x3f, 0x20, 0x1b]),
         }),
         ("sushiswap", 137) => Ok(RouterInfo {
-            address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506".parse().unwrap(),
+            address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506".parse().expect("valid Polygon SushiSwap router address"),
             code_hash_prefix: None,
         }),
 
         // Arbitrum
         ("uniswap_v3", 42161) => Ok(RouterInfo {
-            address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().unwrap(),
+            address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().expect("valid Arbitrum Uniswap V3 router address"),
             code_hash_prefix: Some([0x52, 0x9b, 0x8c, 0x4d, 0xae, 0x3f, 0x20, 0x1b]),
         }),
         ("sushiswap", 42161) => Ok(RouterInfo {
-            address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506".parse().unwrap(),
+            address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506".parse().expect("valid Arbitrum SushiSwap router address"),
             code_hash_prefix: None,
         }),
 
         // Base
         ("uniswap_v3", 8453) => Ok(RouterInfo {
-            address: "0x2626664c2603336E57B271c5C0b26F421741e481".parse().unwrap(),
+            address: "0x2626664c2603336E57B271c5C0b26F421741e481".parse().expect("valid Base Uniswap V3 router address"),
             code_hash_prefix: None,
         }),
 
@@ -556,12 +556,12 @@ fn get_verified_router(protocol: &str, chain_id: u64) -> Result<RouterInfo> {
 /// Get common token addresses for a chain.
 pub fn get_weth_address(chain_id: u64) -> Option<Address> {
     match chain_id {
-        1 => Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse().unwrap()), // Mainnet
-        5 => Some("0xB4FBF271143F4FBf7B91A5ded31805e42b2208d6".parse().unwrap()), // Goerli
-        11155111 => Some("0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9".parse().unwrap()), // Sepolia
-        137 => Some("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270".parse().unwrap()), // Polygon (WMATIC)
-        42161 => Some("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1".parse().unwrap()), // Arbitrum
-        8453 => Some("0x4200000000000000000000000000000000000006".parse().unwrap()), // Base
+        1 => Some("0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".parse().expect("valid Mainnet WETH address")), // Mainnet
+        5 => Some("0xB4FBF271143F4FBf7B91A5ded31805e42b2208d6".parse().expect("valid Goerli WETH address")), // Goerli
+        11155111 => Some("0x7b79995e5f793A07Bc00c21412e50Ecae098E7f9".parse().expect("valid Sepolia WETH address")), // Sepolia
+        137 => Some("0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270".parse().expect("valid Polygon WMATIC address")), // Polygon (WMATIC)
+        42161 => Some("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1".parse().expect("valid Arbitrum WETH address")), // Arbitrum
+        8453 => Some("0x4200000000000000000000000000000000000006".parse().expect("valid Base WETH address")), // Base
         _ => None,
     }
 }

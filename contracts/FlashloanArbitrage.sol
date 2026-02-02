@@ -10,6 +10,15 @@ import "./interfaces/IUniswapV3.sol";
  * @title FlashloanArbitrage
  * @notice Gas-optimized flashloan arbitrage contract for MEV extraction
  * @dev Supports Balancer (0% fee) and Aave V3 flashloans with multi-DEX routing
+ *
+ * SECURITY CONSIDERATIONS:
+ * - Uses Solidity 0.8.20+ with built-in overflow/underflow protection
+ * - Implements custom reentrancy guard to prevent cross-function reentrancy
+ * - Flash loan callbacks validated via sender check AND in-progress flag
+ * - Two-step ownership transfer prevents accidental ownership loss
+ * - All external calls use safe wrappers with return value checks
+ * - Approved router whitelist prevents arbitrary contract interactions
+ * - No delegatecall usage to prevent storage corruption attacks
  */
 contract FlashloanArbitrage is IFlashLoanRecipient {
     /*//////////////////////////////////////////////////////////////
@@ -25,6 +34,9 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
     error ReentrancyGuard();
     error ZeroAddress();
     error ZeroAmount();
+    error InvalidPool();
+    error RouterNotApproved();
+    error ArrayLengthMismatch();
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -98,10 +110,20 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
     uint256 private _status;
 
     /// @notice Approved routers for swap execution
+    /// @dev SECURITY: Only whitelisted routers can be used to prevent malicious contract calls
     mapping(address => bool) public approvedRouters;
 
+    /// @notice Approved Aave pools for flashloan execution
+    /// @dev SECURITY: Only whitelisted pools can be used to prevent fake pool attacks
+    mapping(address => bool) public approvedAavePools;
+
     /// @notice Flash loan in progress flag (for callback validation)
+    /// @dev SECURITY: Prevents unauthorized external calls to callback functions
     bool private _flashLoanInProgress;
+
+    /// @notice Expected Aave pool for current flashloan (for callback validation)
+    /// @dev SECURITY: Validates that callback comes from the expected pool
+    address private _expectedAavePool;
 
     /*//////////////////////////////////////////////////////////////
                                MODIFIERS
@@ -139,6 +161,12 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
      * @param amounts Array of amounts to borrow
      * @param swapData Encoded swap steps for arbitrage execution
      * @dev Balancer flashloans are preferred due to zero fees
+     *
+     * SECURITY NOTES:
+     * - onlyOwner: Prevents unauthorized users from executing arbitrage
+     * - nonReentrant: Prevents reentrancy attacks during swap execution
+     * - _flashLoanInProgress flag: Validates callback authenticity
+     * - Array length validation: Prevents out-of-bounds access
      */
     function executeBalancerFlashloan(
         address[] calldata tokens,
@@ -147,9 +175,16 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
     ) external onlyOwner nonReentrant {
         uint256 gasStart = gasleft();
 
-        // Validate inputs
-        if (tokens.length == 0 || tokens.length != amounts.length)
-            revert InvalidSwapData();
+        // SECURITY: Validate array lengths to prevent out-of-bounds access
+        if (tokens.length == 0) revert InvalidSwapData();
+        if (tokens.length != amounts.length) revert ArrayLengthMismatch();
+
+        // SECURITY: Validate no zero addresses or amounts
+        for (uint256 i = 0; i < tokens.length; ) {
+            if (tokens[i] == address(0)) revert ZeroAddress();
+            if (amounts[i] == 0) revert ZeroAmount();
+            unchecked { ++i; }
+        }
 
         // Set flag to validate callback
         _flashLoanInProgress = true;
@@ -181,6 +216,12 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
      * @param feeAmounts Array of fees (always 0 for Balancer)
      * @param userData Encoded swap steps
      * @dev MUST repay borrowed amounts before returning
+     *
+     * SECURITY NOTES:
+     * - Validates msg.sender is BALANCER_VAULT (hardcoded immutable address)
+     * - Validates _flashLoanInProgress flag to prevent external calls
+     * - Both checks required: msg.sender can be spoofed if vault is compromised,
+     *   flag prevents calls when we didn't initiate the flashloan
      */
     function receiveFlashLoan(
         address[] memory tokens,
@@ -188,7 +229,8 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
         uint256[] memory feeAmounts,
         bytes memory userData
     ) external override {
-        // Validate callback is from Balancer Vault
+        // SECURITY: Dual validation - sender AND in-progress flag
+        // This prevents both external calls and potential vault compromise scenarios
         if (msg.sender != BALANCER_VAULT) revert InvalidCallback();
         if (!_flashLoanInProgress) revert InvalidCallback();
 
@@ -220,6 +262,11 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
      * @param amounts Array of amounts to borrow
      * @param swapData Encoded swap steps
      * @dev Aave charges 0.09% fee - use when Balancer lacks liquidity
+     *
+     * SECURITY NOTES:
+     * - Pool address is validated against whitelist to prevent fake pool attacks
+     * - A malicious pool could call our callback with arbitrary data
+     * - _expectedAavePool stores which pool should be calling back
      */
     function executeAaveFlashloan(
         address pool,
@@ -229,12 +276,23 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
     ) external onlyOwner nonReentrant {
         uint256 gasStart = gasleft();
 
-        // Validate inputs
-        if (assets.length == 0 || assets.length != amounts.length)
-            revert InvalidSwapData();
+        // SECURITY: Validate pool is whitelisted to prevent fake pool attacks
+        if (!approvedAavePools[pool]) revert InvalidPool();
 
-        // Set flag
+        // SECURITY: Validate array lengths
+        if (assets.length == 0) revert InvalidSwapData();
+        if (assets.length != amounts.length) revert ArrayLengthMismatch();
+
+        // SECURITY: Validate no zero addresses or amounts
+        for (uint256 i = 0; i < assets.length; ) {
+            if (assets[i] == address(0)) revert ZeroAddress();
+            if (amounts[i] == 0) revert ZeroAmount();
+            unchecked { ++i; }
+        }
+
+        // Set flags for callback validation
         _flashLoanInProgress = true;
+        _expectedAavePool = pool;
 
         // Interest rate modes: 0 = no debt (repay in same tx)
         uint256[] memory modes = new uint256[](assets.length);
@@ -250,7 +308,9 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
             0 // referral code
         );
 
+        // Clear flags
         _flashLoanInProgress = false;
+        _expectedAavePool = address(0);
 
         emit ArbitrageExecuted(
             assets[0],
@@ -268,6 +328,12 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
      * @param initiator Address that initiated the flashloan
      * @param params Encoded swap steps
      * @return True if operation succeeded
+     *
+     * SECURITY NOTES:
+     * - Triple validation: initiator, in-progress flag, AND expected pool
+     * - initiator check ensures we initiated the loan (prevents griefing)
+     * - msg.sender check ensures callback from expected pool (prevents fake pools)
+     * - _flashLoanInProgress ensures we're in an active flashloan context
      */
     function executeOperation(
         address[] calldata assets,
@@ -276,9 +342,13 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
         address initiator,
         bytes calldata params
     ) external returns (bool) {
-        // Validate callback
+        // SECURITY: Triple validation for callback authenticity
+        // 1. Check initiator is this contract (we started the flashloan)
         if (initiator != address(this)) revert InvalidCallback();
+        // 2. Check we're in an active flashloan
         if (!_flashLoanInProgress) revert InvalidCallback();
+        // 3. Check msg.sender is the expected pool (prevents fake pool callbacks)
+        if (msg.sender != _expectedAavePool) revert InvalidCallback();
 
         // Decode and execute swaps
         SwapStep[] memory steps = abi.decode(params, (SwapStep[]));
@@ -310,12 +380,29 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
      * @notice Execute multi-step arbitrage swaps
      * @param steps Array of swap steps to execute
      * @return profit Total profit from arbitrage
+     *
+     * SECURITY NOTES:
+     * - Router addresses validated against whitelist for non-Balancer swaps
+     * - Token addresses validated to prevent zero address interactions
+     * - minAmountOut enforced for slippage protection
+     * - Uses unchecked increment for gas optimization (safe due to array bounds)
      */
     function _executeArbitrage(
         SwapStep[] memory steps
     ) internal returns (uint256 profit) {
+        if (steps.length == 0) revert InvalidSwapData();
+
         for (uint256 i = 0; i < steps.length; ) {
             SwapStep memory step = steps[i];
+
+            // SECURITY: Validate token addresses
+            if (step.tokenIn == address(0) || step.tokenOut == address(0))
+                revert ZeroAddress();
+
+            // SECURITY: Validate router is approved (except for Balancer which uses vault)
+            if (step.protocol != PROTOCOL_BALANCER) {
+                if (!approvedRouters[step.router]) revert RouterNotApproved();
+            }
 
             // Determine input amount
             uint256 amountIn = step.amountIn;
@@ -374,6 +461,11 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
 
     /**
      * @notice Execute swap on Uniswap V2 compatible router
+     * @dev SECURITY: Uses safeApprove pattern - approves exact amount needed
+     *      This prevents approval front-running attacks where an attacker
+     *      could use existing approval before new amount is set
+     *
+     * GAS OPTIMIZATION: Uses block.timestamp for deadline (same block execution)
      */
     function _swapUniswapV2(
         address router,
@@ -383,7 +475,9 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
         uint256 minAmountOut,
         bytes memory /* swapData */
     ) internal returns (uint256 amountOut) {
-        // Approve router
+        // SECURITY: Reset approval to 0 first to handle non-standard tokens (e.g., USDT)
+        // that require approval to be 0 before setting a new value
+        _safeApprove(tokenIn, router, 0);
         _safeApprove(tokenIn, router, amountIn);
 
         // Build path
@@ -402,10 +496,16 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
             );
 
         amountOut = amounts[amounts.length - 1];
+
+        // GAS OPTIMIZATION: Clear approval after swap to prevent lingering approvals
+        // This also protects against potential router vulnerabilities
+        _safeApprove(tokenIn, router, 0);
     }
 
     /**
      * @notice Execute swap on Uniswap V3
+     * @dev SECURITY: Uses safeApprove pattern with reset to 0
+     *      Fee is decoded from swapData, defaults to 0.3% (3000) if not provided
      */
     function _swapUniswapV3(
         address router,
@@ -415,10 +515,11 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
         uint256 minAmountOut,
         bytes memory swapData
     ) internal returns (uint256 amountOut) {
-        // Approve router
+        // SECURITY: Reset and set approval (handles non-standard tokens)
+        _safeApprove(tokenIn, router, 0);
         _safeApprove(tokenIn, router, amountIn);
 
-        // Decode fee from swapData
+        // Decode fee from swapData (default 0.3% = 3000 basis points)
         uint24 fee = swapData.length >= 3
             ? abi.decode(swapData, (uint24))
             : 3000;
@@ -436,10 +537,15 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
             });
 
         amountOut = ISwapRouter(router).exactInputSingle(params);
+
+        // SECURITY: Clear approval after swap
+        _safeApprove(tokenIn, router, 0);
     }
 
     /**
      * @notice Execute swap on Balancer
+     * @dev SECURITY: Balancer vault is a constant address (same on all chains)
+     *      No router validation needed as BALANCER_VAULT is immutable
      */
     function _swapBalancer(
         address tokenIn,
@@ -448,7 +554,11 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
         uint256 minAmountOut,
         bytes memory swapData
     ) internal returns (uint256 amountOut) {
-        // Approve vault
+        // SECURITY: Validate swapData contains poolId
+        if (swapData.length < 32) revert InvalidSwapData();
+
+        // SECURITY: Reset and set approval
+        _safeApprove(tokenIn, BALANCER_VAULT, 0);
         _safeApprove(tokenIn, BALANCER_VAULT, amountIn);
 
         // Decode poolId from swapData
@@ -479,10 +589,20 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
             minAmountOut,
             block.timestamp
         );
+
+        // SECURITY: Clear approval after swap
+        _safeApprove(tokenIn, BALANCER_VAULT, 0);
     }
 
     /**
      * @notice Execute generic swap with raw calldata
+     * @dev SECURITY: This function allows arbitrary calls to approved routers
+     *      Router MUST be in approvedRouters whitelist (checked in _executeArbitrage)
+     *      Use with caution - ensure swapData is properly validated off-chain
+     *
+     * WARNING: This calculates output as change in tokenIn balance, which may not
+     *          be accurate for all swap types. Consider using protocol-specific
+     *          functions when possible.
      */
     function _swapGeneric(
         address router,
@@ -490,18 +610,26 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
         uint256 amountIn,
         bytes memory swapData
     ) internal returns (uint256 amountOut) {
-        // Approve router
+        // SECURITY: Validate swapData is not empty
+        if (swapData.length == 0) revert InvalidSwapData();
+
+        // SECURITY: Reset and set approval
+        _safeApprove(tokenIn, router, 0);
         _safeApprove(tokenIn, router, amountIn);
 
         // Record balance before
         uint256 balanceBefore = _getBalance(tokenIn);
 
         // Execute raw call
+        // SECURITY NOTE: Router is validated in _executeArbitrage before reaching here
         (bool success, ) = router.call(swapData);
         if (!success) revert SwapFailed();
 
         // Calculate output (assume single output token)
         amountOut = balanceBefore - _getBalance(tokenIn);
+
+        // SECURITY: Clear approval after swap
+        _safeApprove(tokenIn, router, 0);
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -512,6 +640,8 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
      * @notice Approve a router for swap execution
      * @param router Router address to approve
      * @param approved Approval status
+     * @dev SECURITY: Only owner can modify whitelist. Review router contracts
+     *      before adding to whitelist to ensure they don't have vulnerabilities.
      */
     function setApprovedRouter(
         address router,
@@ -519,6 +649,21 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
     ) external onlyOwner {
         if (router == address(0)) revert ZeroAddress();
         approvedRouters[router] = approved;
+    }
+
+    /**
+     * @notice Approve an Aave pool for flashloan execution
+     * @param pool Aave V3 Pool address to approve
+     * @param approved Approval status
+     * @dev SECURITY: Only add official Aave pool addresses. Fake pools can
+     *      call our callback with malicious data.
+     */
+    function setApprovedAavePool(
+        address pool,
+        bool approved
+    ) external onlyOwner {
+        if (pool == address(0)) revert ZeroAddress();
+        approvedAavePools[pool] = approved;
     }
 
     /**

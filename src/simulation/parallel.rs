@@ -76,7 +76,7 @@ impl ParallelSimulator {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.num_workers)
             .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().expect("default rayon thread pool should always build"));
 
         let base_sim = &self.base_simulator;
 
@@ -109,7 +109,7 @@ impl ParallelSimulator {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.num_workers)
             .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().expect("default rayon thread pool should always build"));
 
         let base_sim = &self.base_simulator;
 
@@ -150,7 +150,7 @@ impl ParallelSimulator {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(self.num_workers)
             .build()
-            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().unwrap());
+            .unwrap_or_else(|_| rayon::ThreadPoolBuilder::new().build().expect("default rayon thread pool should always build"));
 
         let base_sim = &self.base_simulator;
 

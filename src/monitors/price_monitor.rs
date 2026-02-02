@@ -237,7 +237,7 @@ impl PriceMonitor {
     /// Build multicall for V2 pools (getReserves)
     fn build_v2_calls(&self, pools: &[(&Address, &PoolInfo)]) -> Vec<Call3> {
         // getReserves() selector: 0x0902f1ac
-        let get_reserves_selector = hex::decode("0902f1ac").unwrap();
+        let get_reserves_selector = hex::decode("0902f1ac").expect("valid hex for getReserves selector");
 
         pools
             .iter()
@@ -256,8 +256,8 @@ impl PriceMonitor {
     fn build_v3_calls(&self, pools: &[(&Address, &PoolInfo)]) -> Vec<Call3> {
         // slot0() selector: 0x3850c7bd
         // liquidity() selector: 0x1a686502
-        let slot0_selector = hex::decode("3850c7bd").unwrap();
-        let liquidity_selector = hex::decode("1a686502").unwrap();
+        let slot0_selector = hex::decode("3850c7bd").expect("valid hex for slot0 selector");
+        let liquidity_selector = hex::decode("1a686502").expect("valid hex for liquidity selector");
 
         let mut calls = Vec::new();
 
@@ -568,7 +568,9 @@ impl PriceMonitor {
         event_tx: mpsc::Sender<MonitorEvent>,
         mut stop_rx: mpsc::Receiver<()>,
     ) {
-        let provider = ProviderBuilder::new().on_http(self.http_url.parse().unwrap());
+        let provider = ProviderBuilder::new().on_http(
+            self.http_url.parse().expect("http_url should be a valid URL")
+        );
 
         let poll_interval = Duration::from_millis(self.config.poll_interval_ms);
 

@@ -528,7 +528,9 @@ impl MempoolMonitor {
         mut stop_rx: mpsc::Receiver<()>,
     ) {
         // Create HTTP provider for fetching full transactions
-        let http_provider = ProviderBuilder::new().on_http(self.http_url.parse().unwrap());
+        let http_provider = ProviderBuilder::new().on_http(
+            self.http_url.parse().expect("http_url should be a valid URL")
+        );
 
         while self.running.load(Ordering::Relaxed) {
             // Connect with exponential backoff

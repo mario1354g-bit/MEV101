@@ -778,7 +778,7 @@ pub fn generate_opportunity_id(opp_type: OpportunityType, tokens: &[Address]) ->
 
     let timestamp = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock is before Unix epoch")
         .as_nanos();
 
     let token_str: String = tokens

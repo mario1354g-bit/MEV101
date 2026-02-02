@@ -5,6 +5,12 @@ pragma solidity ^0.8.20;
  * @title IBalancerVault
  * @notice Interface for Balancer V2 Vault flash loans
  * @dev Balancer flash loans have 0% fee, making them ideal for MEV
+ *
+ * SECURITY CONSIDERATIONS:
+ * - Balancer Vault address is constant across all chains: 0xBA12222222228d8Ba445958a75a0704d566BF2C8
+ * - Flash loan callbacks MUST repay borrowed amount before returning
+ * - Always validate msg.sender in receiveFlashLoan callback
+ * - Use flash loan in-progress flag to prevent unauthorized callback invocation
  */
 interface IBalancerVault {
     /**
@@ -140,6 +146,13 @@ interface IBalancerVault {
 /**
  * @title IFlashLoanRecipient
  * @notice Interface for Balancer flash loan recipient callback
+ *
+ * SECURITY IMPLEMENTATION GUIDE:
+ * 1. ALWAYS check msg.sender == BALANCER_VAULT in receiveFlashLoan
+ * 2. Use a flash loan in-progress flag set before calling flashLoan
+ * 3. Check the flag in callback to prevent unauthorized calls
+ * 4. Clear the flag after flashLoan completes
+ * 5. Use reentrancy guard on the function initiating the flash loan
  */
 interface IFlashLoanRecipient {
     /**
@@ -150,6 +163,10 @@ interface IFlashLoanRecipient {
      * @param userData Arbitrary data passed from flashLoan call
      * @dev MUST repay tokens + fees to Vault before returning
      * @dev With Balancer, feeAmounts are always 0
+     *
+     * SECURITY: Implementations MUST validate:
+     * - msg.sender is the Balancer Vault
+     * - Flash loan was initiated by this contract (use flag)
      */
     function receiveFlashLoan(
         address[] memory tokens,

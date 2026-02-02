@@ -78,13 +78,21 @@ pub struct FlashbotsConfig {
 /// Ethereum network and provider configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EthereumConfig {
-    /// HTTP RPC endpoint URL (can be overridden by ETH_RPC_URL env var)
+    /// Primary HTTP RPC endpoint URL - local reth node (can be overridden by ETH_RPC_URL env var)
     #[serde(default = "default_http_rpc_url")]
     pub http_rpc_url: String,
 
-    /// WebSocket RPC endpoint URL (can be overridden by ETH_WS_URL env var)
+    /// Primary WebSocket RPC endpoint URL - local reth node (can be overridden by ETH_WS_URL env var)
     #[serde(default = "default_ws_rpc_url")]
     pub ws_rpc_url: String,
+
+    /// Fallback HTTP RPC endpoint URL - Alchemy (can be overridden by ALCHEMY_HTTP_URL env var)
+    #[serde(default)]
+    pub fallback_http_url: Option<String>,
+
+    /// Fallback WebSocket RPC endpoint URL - Alchemy (can be overridden by ALCHEMY_WS_URL env var)
+    #[serde(default)]
+    pub fallback_ws_url: Option<String>,
 
     /// Chain ID (1 = mainnet, 5 = goerli, 11155111 = sepolia)
     #[serde(default = "default_chain_id")]
@@ -421,6 +429,8 @@ impl Default for EthereumConfig {
         Self {
             http_rpc_url: default_http_rpc_url(),
             ws_rpc_url: default_ws_rpc_url(),
+            fallback_http_url: None,
+            fallback_ws_url: None,
             chain_id: default_chain_id(),
             request_timeout_secs: default_request_timeout(),
             max_retries: default_max_retries(),
@@ -526,13 +536,22 @@ impl Config {
 
     /// Apply environment variable overrides
     fn apply_env_overrides(&mut self) -> ConfigResult<()> {
-        // Ethereum overrides
+        // Ethereum overrides - primary endpoints (local reth node)
         if let Ok(url) = std::env::var("ETH_RPC_URL") {
             self.ethereum.http_rpc_url = url;
         }
         if let Ok(url) = std::env::var("ETH_WS_URL") {
             self.ethereum.ws_rpc_url = url;
         }
+
+        // Fallback endpoints (Alchemy) - optional
+        if let Ok(url) = std::env::var("ALCHEMY_HTTP_URL") {
+            self.ethereum.fallback_http_url = Some(url);
+        }
+        if let Ok(url) = std::env::var("ALCHEMY_WS_URL") {
+            self.ethereum.fallback_ws_url = Some(url);
+        }
+
         if let Ok(chain_id) = std::env::var("CHAIN_ID") {
             self.ethereum.chain_id = chain_id.parse().map_err(|_| {
                 ConfigError::InvalidValue {

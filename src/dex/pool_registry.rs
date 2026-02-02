@@ -492,7 +492,7 @@ impl PoolRegistry {
 
         for fee in ALL_FEE_TIERS {
             let pool_address = factory_contract
-                .getPool(token_a, token_b, fee.try_into().unwrap())
+                .getPool(token_a, token_b, fee.try_into().expect("fee tier fits in u24"))
                 .call()
                 .await
                 .map_err(|e| DexError::ContractCall(e.to_string()))?

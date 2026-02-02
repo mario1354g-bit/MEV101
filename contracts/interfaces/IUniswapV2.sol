@@ -4,6 +4,13 @@ pragma solidity ^0.8.20;
 /**
  * @title IUniswapV2Router02
  * @notice Interface for Uniswap V2 Router swaps
+ *
+ * SECURITY CONSIDERATIONS:
+ * - Always use deadline parameter to prevent stale transactions
+ * - Use amountOutMin/amountInMax for slippage protection
+ * - Approve exact amounts needed, reset to 0 after swaps
+ * - For non-standard tokens (e.g., USDT), reset approval to 0 before setting new value
+ * - Verify router address is legitimate before interaction
  */
 interface IUniswapV2Router02 {
     /**
@@ -110,6 +117,13 @@ interface IUniswapV2Router02 {
 /**
  * @title IUniswapV2Pair
  * @notice Interface for Uniswap V2 pair direct interaction
+ *
+ * SECURITY CONSIDERATIONS:
+ * - Direct pair interaction bypasses router safety checks
+ * - Must transfer tokens to pair before calling swap
+ * - No slippage protection built-in - calculate amounts off-chain
+ * - Verify pair address is legitimate (created by factory)
+ * - Empty data parameter disables flash swap callback
  */
 interface IUniswapV2Pair {
     /**

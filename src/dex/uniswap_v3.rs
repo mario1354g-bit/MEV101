@@ -345,7 +345,7 @@ impl UniswapV3 {
         let factory = IUniswapV3Factory::new(self.factory, provider);
 
         let pool = factory
-            .getPool(token_a, token_b, fee.try_into().unwrap())
+            .getPool(token_a, token_b, fee.try_into().map_err(|_| DexError::InvalidParameters("fee does not fit in u24".into()))?)
             .call()
             .await
             .map_err(|e| DexError::ContractCall(e.to_string()))?
@@ -426,7 +426,7 @@ impl UniswapV3 {
             .map_err(|e| DexError::ContractCall(e.to_string()))?
             ._0;
 
-        Ok(fee.try_into().unwrap())
+        Ok(fee.try_into().map_err(|_| DexError::InvalidParameters("fee does not fit in u32".into()))?)
     }
 
     /// Get current liquidity for a pool
@@ -848,7 +848,7 @@ impl Dex for UniswapV3 {
                 params: ISwapRouter02::ExactInputSingleParams {
                     tokenIn: params.token_in,
                     tokenOut: params.token_out,
-                    fee: fee.try_into().unwrap(),
+                    fee: fee.try_into().map_err(|_| DexError::InvalidParameters("fee does not fit in u24".into()))?,
                     recipient: params.recipient,
                     amountIn: params.amount_in,
                     amountOutMinimum: params.amount_out_min,
@@ -864,7 +864,7 @@ impl Dex for UniswapV3 {
                 params: ISwapRouter::ExactInputSingleParams {
                     tokenIn: params.token_in,
                     tokenOut: params.token_out,
-                    fee: fee.try_into().unwrap(),
+                    fee: fee.try_into().map_err(|_| DexError::InvalidParameters("fee does not fit in u24".into()))?,
                     recipient: params.recipient,
                     deadline: params.deadline,
                     amountIn: params.amount_in,
@@ -901,7 +901,7 @@ impl Dex for UniswapV3 {
                     recipient: decoded.params.recipient,
                     deadline: decoded.params.deadline,
                     path: vec![decoded.params.tokenIn, decoded.params.tokenOut],
-                    fee: Some(decoded.params.fee.try_into().unwrap()),
+                    fee: Some(decoded.params.fee.try_into().expect("u24 fee fits in u32")),
                 })
             }
             selectors::EXACT_INPUT_SINGLE_02 => {
@@ -917,7 +917,7 @@ impl Dex for UniswapV3 {
                     recipient: decoded.params.recipient,
                     deadline: U256::MAX, // No deadline in Router02
                     path: vec![decoded.params.tokenIn, decoded.params.tokenOut],
-                    fee: Some(decoded.params.fee.try_into().unwrap()),
+                    fee: Some(decoded.params.fee.try_into().expect("u24 fee fits in u32")),
                 })
             }
             selectors::EXACT_INPUT => {
@@ -969,7 +969,7 @@ impl Dex for UniswapV3 {
                     recipient: decoded.params.recipient,
                     deadline: decoded.params.deadline,
                     path: vec![decoded.params.tokenIn, decoded.params.tokenOut],
-                    fee: Some(decoded.params.fee.try_into().unwrap()),
+                    fee: Some(decoded.params.fee.try_into().expect("u24 fee fits in u32")),
                 })
             }
             selectors::EXACT_OUTPUT_SINGLE_02 => {
@@ -985,7 +985,7 @@ impl Dex for UniswapV3 {
                     recipient: decoded.params.recipient,
                     deadline: U256::MAX,
                     path: vec![decoded.params.tokenIn, decoded.params.tokenOut],
-                    fee: Some(decoded.params.fee.try_into().unwrap()),
+                    fee: Some(decoded.params.fee.try_into().expect("u24 fee fits in u32")),
                 })
             }
             selectors::EXACT_OUTPUT => {
