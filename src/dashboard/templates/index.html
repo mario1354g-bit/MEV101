@@ -1,0 +1,704 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MEV Monitor Dashboard</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+    <style>
+        :root {
+            --profit-color: #22c55e;
+            --loss-color: #ef4444;
+            --pending-color: #f59e0b;
+            --neutral-color: #6b7280;
+        }
+
+        body {
+            max-width: 1400px;
+            padding: 1rem;
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        header h1 {
+            margin: 0;
+        }
+
+        .status-indicator {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .status-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--profit-color);
+            animation: pulse 2s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        /* Stats Cards */
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .stat-card {
+            background: var(--background-body);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+        }
+
+        .stat-card h3 {
+            margin: 0 0 0.5rem 0;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .stat-card .value {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+
+        .stat-card .sub-value {
+            font-size: 0.875rem;
+            color: var(--text-muted);
+        }
+
+        .profit { color: var(--profit-color); }
+        .loss { color: var(--loss-color); }
+        .pending { color: var(--pending-color); }
+
+        /* Filters */
+        .filters {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 1rem;
+            margin-bottom: 1.5rem;
+            padding: 1rem;
+            background: var(--background-body);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+        }
+
+        .filters label {
+            display: flex;
+            flex-direction: column;
+            gap: 0.25rem;
+            font-size: 0.875rem;
+        }
+
+        .filters select,
+        .filters input {
+            padding: 0.5rem;
+            min-width: 150px;
+        }
+
+        .filters button {
+            align-self: flex-end;
+        }
+
+        /* Table */
+        .table-container {
+            overflow-x: auto;
+            margin-bottom: 2rem;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+
+        th {
+            text-align: left;
+            background: var(--background-alt);
+            position: sticky;
+            top: 0;
+        }
+
+        th, td {
+            padding: 0.75rem;
+            border-bottom: 1px solid var(--border);
+        }
+
+        tr:hover {
+            background: var(--background-alt);
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: 500;
+        }
+
+        .badge-type {
+            background: #3b82f6;
+            color: white;
+        }
+
+        .badge-simulated {
+            background: #8b5cf6;
+            color: white;
+        }
+
+        .badge-executed {
+            background: var(--profit-color);
+            color: white;
+        }
+
+        .badge-competitor {
+            background: var(--loss-color);
+            color: white;
+        }
+
+        /* Hourly Heatmap */
+        .heatmap-section {
+            margin-bottom: 2rem;
+        }
+
+        .heatmap {
+            display: flex;
+            gap: 4px;
+            padding: 1rem;
+            background: var(--background-body);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            overflow-x: auto;
+        }
+
+        .heatmap-hour {
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            gap: 4px;
+        }
+
+        .heatmap-cell {
+            width: 32px;
+            height: 32px;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 0.625rem;
+            color: white;
+            cursor: pointer;
+        }
+
+        .heatmap-label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        /* Type Analysis */
+        .analysis-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1rem;
+            margin-bottom: 2rem;
+        }
+
+        .analysis-card {
+            background: var(--background-body);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1rem;
+        }
+
+        .analysis-card h3 {
+            margin-top: 0;
+        }
+
+        .bar-chart {
+            display: flex;
+            flex-direction: column;
+            gap: 0.5rem;
+        }
+
+        .bar-row {
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+        }
+
+        .bar-label {
+            width: 120px;
+            font-size: 0.75rem;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+
+        .bar-track {
+            flex: 1;
+            height: 20px;
+            background: var(--background-alt);
+            border-radius: 4px;
+            overflow: hidden;
+        }
+
+        .bar-fill {
+            height: 100%;
+            background: #3b82f6;
+            border-radius: 4px;
+            display: flex;
+            align-items: center;
+            justify-content: flex-end;
+            padding-right: 0.5rem;
+            font-size: 0.625rem;
+            color: white;
+            min-width: fit-content;
+        }
+
+        /* Pagination */
+        .pagination {
+            display: flex;
+            justify-content: center;
+            gap: 0.5rem;
+            margin-top: 1rem;
+        }
+
+        .pagination button {
+            padding: 0.5rem 1rem;
+        }
+
+        /* Footer */
+        footer {
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--border);
+            text-align: center;
+            color: var(--text-muted);
+            font-size: 0.875rem;
+        }
+
+        .loading {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-muted);
+        }
+
+        .error {
+            color: var(--loss-color);
+            padding: 1rem;
+            background: rgba(239, 68, 68, 0.1);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+
+        .tx-hash {
+            font-family: monospace;
+            font-size: 0.75rem;
+        }
+
+        .tx-hash a {
+            color: inherit;
+        }
+    </style>
+</head>
+<body>
+    <header>
+        <h1>MEV Monitor Dashboard</h1>
+        <div class="status-indicator">
+            <span class="status-dot"></span>
+            <span id="last-update">Loading...</span>
+        </div>
+    </header>
+
+    <main>
+        <!-- Stats Section -->
+        <section id="stats-section">
+            <div class="stats-grid" id="stats-grid">
+                <div class="stat-card">
+                    <h3>Total Opportunities</h3>
+                    <div class="value" id="stat-total">-</div>
+                    <div class="sub-value"><span id="stat-24h">-</span> in 24h</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Estimated Profit</h3>
+                    <div class="value profit" id="stat-estimated-profit">-</div>
+                    <div class="sub-value">Total estimated</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Executed Profit</h3>
+                    <div class="value profit" id="stat-executed-profit">-</div>
+                    <div class="sub-value"><span id="stat-executed-count">-</span> executions</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Simulated</h3>
+                    <div class="value" id="stat-simulated">-</div>
+                    <div class="sub-value">opportunities simulated</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Competitor Captured</h3>
+                    <div class="value loss" id="stat-competitor">-</div>
+                    <div class="sub-value">missed opportunities</div>
+                </div>
+                <div class="stat-card">
+                    <h3>Active Pools</h3>
+                    <div class="value" id="stat-pools">-</div>
+                    <div class="sub-value">being monitored</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Hourly Heatmap -->
+        <section class="heatmap-section">
+            <h2>Opportunity Distribution (Last 7 Days, UTC)</h2>
+            <div class="heatmap" id="heatmap">
+                <div class="loading">Loading heatmap...</div>
+            </div>
+        </section>
+
+        <!-- Analysis Section -->
+        <section class="analysis-grid">
+            <div class="analysis-card">
+                <h3>By Opportunity Type</h3>
+                <div class="bar-chart" id="type-chart">
+                    <div class="loading">Loading...</div>
+                </div>
+            </div>
+            <div class="analysis-card">
+                <h3>Top Token Pairs</h3>
+                <div class="bar-chart" id="pair-chart">
+                    <div class="loading">Loading...</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- Filters -->
+        <section>
+            <h2>Recent Opportunities</h2>
+            <div class="filters">
+                <label>
+                    Type
+                    <select id="filter-type">
+                        <option value="">All Types</option>
+                        <option value="price_discrepancy">Price Discrepancy</option>
+                        <option value="multi_hop">Multi-Hop</option>
+                        <option value="sandwich">Sandwich</option>
+                        <option value="backrun">Backrun</option>
+                        <option value="liquidation">Liquidation</option>
+                        <option value="liquidity_event">Liquidity Event</option>
+                    </select>
+                </label>
+                <label>
+                    Status
+                    <select id="filter-status">
+                        <option value="">All</option>
+                        <option value="simulated">Simulated</option>
+                        <option value="executed">Executed</option>
+                    </select>
+                </label>
+                <label>
+                    Min Profit (ETH)
+                    <input type="number" id="filter-min-profit" step="0.001" placeholder="0.01">
+                </label>
+                <label>
+                    Token Pair
+                    <input type="text" id="filter-pair" placeholder="e.g., WETH/USDC">
+                </label>
+                <button onclick="applyFilters()">Apply Filters</button>
+                <button onclick="resetFilters()">Reset</button>
+            </div>
+        </section>
+
+        <!-- Opportunities Table -->
+        <section>
+            <div class="table-container">
+                <table>
+                    <thead>
+                        <tr>
+                            <th>ID</th>
+                            <th>Time</th>
+                            <th>Type</th>
+                            <th>Token Pairs</th>
+                            <th>Est. Profit (ETH)</th>
+                            <th>Block</th>
+                            <th>Status</th>
+                            <th>Actions</th>
+                        </tr>
+                    </thead>
+                    <tbody id="opportunities-table">
+                        <tr><td colspan="8" class="loading">Loading opportunities...</td></tr>
+                    </tbody>
+                </table>
+            </div>
+            <div class="pagination">
+                <button id="prev-page" onclick="prevPage()" disabled>Previous</button>
+                <span id="page-info">Page 1</span>
+                <button id="next-page" onclick="nextPage()">Next</button>
+            </div>
+        </section>
+    </main>
+
+    <footer>
+        <p>MEV Monitor Dashboard | Auto-refreshes every 30 seconds</p>
+    </footer>
+
+    <script>
+        // State
+        let currentPage = 0;
+        const pageSize = 50;
+        let currentFilters = {};
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            loadStats();
+            loadHeatmap();
+            loadTypeAnalysis();
+            loadPairAnalysis();
+            loadOpportunities();
+
+            // Auto-refresh every 30 seconds
+            setInterval(() => {
+                loadStats();
+                loadOpportunities();
+            }, 30000);
+        });
+
+        // API calls
+        async function fetchApi(endpoint) {
+            try {
+                const response = await fetch(endpoint);
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                return await response.json();
+            } catch (error) {
+                console.error(`API error: ${endpoint}`, error);
+                return null;
+            }
+        }
+
+        // Load statistics
+        async function loadStats() {
+            const stats = await fetchApi('/api/stats');
+            if (!stats) return;
+
+            document.getElementById('stat-total').textContent = stats.total_opportunities.toLocaleString();
+            document.getElementById('stat-24h').textContent = stats.opportunities_24h.toLocaleString();
+            document.getElementById('stat-estimated-profit').textContent = formatEth(stats.total_estimated_profit_eth);
+            document.getElementById('stat-executed-profit').textContent = formatEth(stats.total_execution_profit_eth);
+            document.getElementById('stat-executed-count').textContent = stats.executed_count.toLocaleString();
+            document.getElementById('stat-simulated').textContent = stats.simulated_count.toLocaleString();
+            document.getElementById('stat-competitor').textContent = stats.competitor_captured_count.toLocaleString();
+            document.getElementById('stat-pools').textContent = stats.active_pools.toLocaleString();
+
+            document.getElementById('last-update').textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
+        }
+
+        // Load hourly heatmap
+        async function loadHeatmap() {
+            const data = await fetchApi('/api/analysis/hourly');
+            if (!data) return;
+
+            const container = document.getElementById('heatmap');
+            container.innerHTML = '';
+
+            data.hours.forEach(hour => {
+                const div = document.createElement('div');
+                div.className = 'heatmap-hour';
+
+                const intensity = hour.intensity;
+                const color = intensity > 0
+                    ? `rgba(59, 130, 246, ${0.2 + intensity * 0.8})`
+                    : 'var(--background-alt)';
+
+                div.innerHTML = `
+                    <div class="heatmap-cell" style="background: ${color}" title="${hour.count} opportunities, ${formatEth(hour.total_profit_eth)} profit">
+                        ${hour.count > 0 ? hour.count : ''}
+                    </div>
+                    <span class="heatmap-label">${String(hour.hour).padStart(2, '0')}</span>
+                `;
+                container.appendChild(div);
+            });
+        }
+
+        // Load type analysis
+        async function loadTypeAnalysis() {
+            const data = await fetchApi('/api/analysis/by-type');
+            if (!data) return;
+
+            const container = document.getElementById('type-chart');
+            if (data.types.length === 0) {
+                container.innerHTML = '<p>No data available</p>';
+                return;
+            }
+
+            const maxCount = Math.max(...data.types.map(t => t.count));
+            container.innerHTML = data.types.map(type => `
+                <div class="bar-row">
+                    <span class="bar-label" title="${type.opportunity_type}">${formatTypeName(type.opportunity_type)}</span>
+                    <div class="bar-track">
+                        <div class="bar-fill" style="width: ${(type.count / maxCount * 100)}%">
+                            ${type.count} (${type.percentage.toFixed(1)}%)
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Load pair analysis
+        async function loadPairAnalysis() {
+            const data = await fetchApi('/api/analysis/by-pair');
+            if (!data) return;
+
+            const container = document.getElementById('pair-chart');
+            if (data.pairs.length === 0) {
+                container.innerHTML = '<p>No data available</p>';
+                return;
+            }
+
+            const topPairs = data.pairs.slice(0, 8);
+            const maxCount = Math.max(...topPairs.map(p => p.count));
+
+            container.innerHTML = topPairs.map(pair => `
+                <div class="bar-row">
+                    <span class="bar-label" title="${pair.token_pair}">${pair.token_pair || 'Unknown'}</span>
+                    <div class="bar-track">
+                        <div class="bar-fill" style="width: ${(pair.count / maxCount * 100)}%">
+                            ${pair.count}
+                        </div>
+                    </div>
+                </div>
+            `).join('');
+        }
+
+        // Load opportunities
+        async function loadOpportunities() {
+            const params = new URLSearchParams({
+                limit: pageSize,
+                offset: currentPage * pageSize,
+                ...currentFilters
+            });
+
+            const opportunities = await fetchApi(`/api/opportunities?${params}`);
+            if (!opportunities) return;
+
+            const tbody = document.getElementById('opportunities-table');
+
+            if (opportunities.length === 0) {
+                tbody.innerHTML = '<tr><td colspan="8" class="loading">No opportunities found</td></tr>';
+                return;
+            }
+
+            tbody.innerHTML = opportunities.map(opp => `
+                <tr>
+                    <td>${opp.id}</td>
+                    <td title="${opp.timestamp_formatted}">${formatTimeAgo(opp.timestamp)}</td>
+                    <td><span class="badge badge-type">${formatTypeName(opp.opportunity_type)}</span></td>
+                    <td>${opp.token_pairs.join(', ') || '-'}</td>
+                    <td class="${opp.estimated_net_profit_eth >= 0 ? 'profit' : 'loss'}">
+                        ${formatEth(opp.estimated_net_profit_eth)}
+                    </td>
+                    <td>${opp.block_number_detected.toLocaleString()}</td>
+                    <td>
+                        ${opp.simulated ? '<span class="badge badge-simulated">Sim</span>' : ''}
+                        ${opp.executed ? '<span class="badge badge-executed">Exec</span>' : ''}
+                        ${opp.captured_by_competitor ? '<span class="badge badge-competitor">Comp</span>' : ''}
+                    </td>
+                    <td>
+                        <a href="/opportunity/${opp.id}">Details</a>
+                    </td>
+                </tr>
+            `).join('');
+
+            // Update pagination
+            document.getElementById('page-info').textContent = `Page ${currentPage + 1}`;
+            document.getElementById('prev-page').disabled = currentPage === 0;
+            document.getElementById('next-page').disabled = opportunities.length < pageSize;
+        }
+
+        // Pagination
+        function prevPage() {
+            if (currentPage > 0) {
+                currentPage--;
+                loadOpportunities();
+            }
+        }
+
+        function nextPage() {
+            currentPage++;
+            loadOpportunities();
+        }
+
+        // Filters
+        function applyFilters() {
+            currentFilters = {};
+            currentPage = 0;
+
+            const type = document.getElementById('filter-type').value;
+            if (type) currentFilters.opportunity_type = type;
+
+            const status = document.getElementById('filter-status').value;
+            if (status === 'simulated') currentFilters.simulated = true;
+            if (status === 'executed') currentFilters.executed = true;
+
+            const minProfit = document.getElementById('filter-min-profit').value;
+            if (minProfit) currentFilters.min_profit_eth = parseFloat(minProfit);
+
+            const pair = document.getElementById('filter-pair').value;
+            if (pair) currentFilters.token_pair = pair;
+
+            loadOpportunities();
+        }
+
+        function resetFilters() {
+            document.getElementById('filter-type').value = '';
+            document.getElementById('filter-status').value = '';
+            document.getElementById('filter-min-profit').value = '';
+            document.getElementById('filter-pair').value = '';
+            currentFilters = {};
+            currentPage = 0;
+            loadOpportunities();
+        }
+
+        // Formatting helpers
+        function formatEth(value) {
+            if (value === null || value === undefined) return '-';
+            if (Math.abs(value) < 0.0001) return '< 0.0001 ETH';
+            return value.toFixed(4) + ' ETH';
+        }
+
+        function formatTypeName(type) {
+            if (!type) return 'Unknown';
+            return type.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        }
+
+        function formatTimeAgo(timestamp) {
+            const seconds = Math.floor((Date.now() - timestamp) / 1000);
+            if (seconds < 60) return `${seconds}s ago`;
+            if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+            if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+            return `${Math.floor(seconds / 86400)}d ago`;
+        }
+
+        function formatTxHash(hash) {
+            if (!hash) return '-';
+            return hash.substring(0, 10) + '...' + hash.substring(hash.length - 8);
+        }
+    </script>
+</body>
+</html>

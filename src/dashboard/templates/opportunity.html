@@ -1,0 +1,589 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Opportunity Details - MEV Monitor</title>
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+    <style>
+        :root {
+            --profit-color: #22c55e;
+            --loss-color: #ef4444;
+            --pending-color: #f59e0b;
+            --neutral-color: #6b7280;
+        }
+
+        body {
+            max-width: 1200px;
+            padding: 1rem;
+        }
+
+        .breadcrumb {
+            margin-bottom: 1rem;
+        }
+
+        .breadcrumb a {
+            color: var(--text-muted);
+        }
+
+        header {
+            display: flex;
+            justify-content: space-between;
+            align-items: flex-start;
+            margin-bottom: 2rem;
+            flex-wrap: wrap;
+            gap: 1rem;
+        }
+
+        header h1 {
+            margin: 0;
+        }
+
+        .header-badges {
+            display: flex;
+            gap: 0.5rem;
+            flex-wrap: wrap;
+        }
+
+        .badge {
+            display: inline-block;
+            padding: 0.375rem 0.75rem;
+            border-radius: 4px;
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+
+        .badge-type {
+            background: #3b82f6;
+            color: white;
+        }
+
+        .badge-simulated {
+            background: #8b5cf6;
+            color: white;
+        }
+
+        .badge-executed {
+            background: var(--profit-color);
+            color: white;
+        }
+
+        .badge-competitor {
+            background: var(--loss-color);
+            color: white;
+        }
+
+        .badge-pending {
+            background: var(--pending-color);
+            color: white;
+        }
+
+        .badge-failed {
+            background: var(--loss-color);
+            color: white;
+        }
+
+        .badge-confirmed {
+            background: var(--profit-color);
+            color: white;
+        }
+
+        /* Cards */
+        .card {
+            background: var(--background-body);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+
+        .card h2 {
+            margin-top: 0;
+            font-size: 1.25rem;
+            border-bottom: 1px solid var(--border);
+            padding-bottom: 0.5rem;
+            margin-bottom: 1rem;
+        }
+
+        /* Detail Grid */
+        .detail-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 1rem;
+        }
+
+        .detail-item {
+            display: flex;
+            flex-direction: column;
+        }
+
+        .detail-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            color: var(--text-muted);
+            margin-bottom: 0.25rem;
+        }
+
+        .detail-value {
+            font-size: 1rem;
+        }
+
+        .detail-value.large {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+
+        .profit { color: var(--profit-color); }
+        .loss { color: var(--loss-color); }
+        .pending { color: var(--pending-color); }
+
+        /* Profit Summary */
+        .profit-summary {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 1rem;
+            padding: 1rem;
+            background: var(--background-alt);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+
+        .profit-item {
+            text-align: center;
+        }
+
+        .profit-item .label {
+            font-size: 0.75rem;
+            color: var(--text-muted);
+        }
+
+        .profit-item .value {
+            font-size: 1.25rem;
+            font-weight: bold;
+        }
+
+        /* JSON Display */
+        .json-display {
+            background: var(--background-alt);
+            border-radius: 4px;
+            padding: 1rem;
+            overflow-x: auto;
+            font-family: monospace;
+            font-size: 0.875rem;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+
+        /* Tables */
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 0.875rem;
+        }
+
+        th, td {
+            padding: 0.75rem;
+            text-align: left;
+            border-bottom: 1px solid var(--border);
+        }
+
+        th {
+            background: var(--background-alt);
+            font-weight: 600;
+        }
+
+        tr:hover {
+            background: var(--background-alt);
+        }
+
+        /* Links */
+        .tx-link {
+            font-family: monospace;
+            font-size: 0.875rem;
+            word-break: break-all;
+        }
+
+        .external-link {
+            margin-left: 0.25rem;
+            font-size: 0.75rem;
+        }
+
+        /* Related */
+        .related-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 1rem;
+        }
+
+        .related-card {
+            padding: 1rem;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+        }
+
+        .related-card h4 {
+            margin: 0 0 0.5rem 0;
+        }
+
+        .related-card p {
+            margin: 0.25rem 0;
+            font-size: 0.875rem;
+            color: var(--text-muted);
+        }
+
+        /* Loading / Error */
+        .loading {
+            text-align: center;
+            padding: 2rem;
+            color: var(--text-muted);
+        }
+
+        .error {
+            color: var(--loss-color);
+            padding: 1rem;
+            background: rgba(239, 68, 68, 0.1);
+            border-radius: 8px;
+            margin-bottom: 1rem;
+        }
+
+        .empty {
+            color: var(--text-muted);
+            font-style: italic;
+        }
+
+        footer {
+            margin-top: 2rem;
+            padding-top: 1rem;
+            border-top: 1px solid var(--border);
+            text-align: center;
+        }
+    </style>
+</head>
+<body>
+    <nav class="breadcrumb">
+        <a href="/">Dashboard</a> / Opportunity #<span id="opp-id">{{OPPORTUNITY_ID}}</span>
+    </nav>
+
+    <header>
+        <div>
+            <h1>Opportunity #<span id="header-id">{{OPPORTUNITY_ID}}</span></h1>
+            <p id="header-time" class="loading">Loading...</p>
+        </div>
+        <div class="header-badges" id="header-badges">
+            <!-- Badges populated by JS -->
+        </div>
+    </header>
+
+    <main id="main-content">
+        <div class="loading">Loading opportunity details...</div>
+    </main>
+
+    <footer>
+        <a href="/">Back to Dashboard</a>
+    </footer>
+
+    <script>
+        const opportunityId = {{OPPORTUNITY_ID}};
+
+        document.addEventListener('DOMContentLoaded', () => {
+            loadOpportunityDetails();
+        });
+
+        async function fetchApi(endpoint) {
+            try {
+                const response = await fetch(endpoint);
+                if (!response.ok) {
+                    if (response.status === 404) {
+                        throw new Error('Opportunity not found');
+                    }
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                return await response.json();
+            } catch (error) {
+                console.error(`API error: ${endpoint}`, error);
+                throw error;
+            }
+        }
+
+        async function loadOpportunityDetails() {
+            const main = document.getElementById('main-content');
+
+            try {
+                const data = await fetchApi(`/api/opportunities/${opportunityId}`);
+                const opp = data.opportunity;
+
+                // Update header
+                document.getElementById('header-time').textContent = opp.timestamp_formatted;
+                updateHeaderBadges(opp);
+
+                // Build main content
+                main.innerHTML = buildMainContent(data);
+
+            } catch (error) {
+                main.innerHTML = `<div class="error">Error loading opportunity: ${error.message}</div>`;
+            }
+        }
+
+        function updateHeaderBadges(opp) {
+            const badges = document.getElementById('header-badges');
+            let html = `<span class="badge badge-type">${formatTypeName(opp.opportunity_type)}</span>`;
+
+            if (opp.simulated) {
+                html += `<span class="badge badge-simulated">Simulated</span>`;
+            }
+            if (opp.executed) {
+                html += `<span class="badge badge-executed">Executed</span>`;
+            }
+            if (opp.captured_by_competitor) {
+                html += `<span class="badge badge-competitor">Competitor Captured</span>`;
+            }
+
+            badges.innerHTML = html;
+        }
+
+        function buildMainContent(data) {
+            const opp = data.opportunity;
+
+            return `
+                <!-- Overview Card -->
+                <section class="card">
+                    <h2>Overview</h2>
+                    <div class="profit-summary">
+                        <div class="profit-item">
+                            <div class="label">Gross Profit</div>
+                            <div class="value profit">${formatEth(opp.estimated_gross_profit_eth)}</div>
+                        </div>
+                        <div class="profit-item">
+                            <div class="label">Gas Cost</div>
+                            <div class="value loss">${formatEth(opp.estimated_gas_cost_eth)}</div>
+                        </div>
+                        <div class="profit-item">
+                            <div class="label">Net Profit</div>
+                            <div class="value ${opp.estimated_net_profit_eth >= 0 ? 'profit' : 'loss'}">
+                                ${formatEth(opp.estimated_net_profit_eth)}
+                            </div>
+                        </div>
+                        ${opp.execution_profit_eth !== null ? `
+                        <div class="profit-item">
+                            <div class="label">Actual Profit</div>
+                            <div class="value ${opp.execution_profit_eth >= 0 ? 'profit' : 'loss'}">
+                                ${formatEth(opp.execution_profit_eth)}
+                            </div>
+                        </div>
+                        ` : ''}
+                    </div>
+
+                    <div class="detail-grid">
+                        <div class="detail-item">
+                            <span class="detail-label">Block Detected</span>
+                            <span class="detail-value">${opp.block_number_detected.toLocaleString()}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Block Disappeared</span>
+                            <span class="detail-value">${opp.block_number_disappeared ? opp.block_number_disappeared.toLocaleString() : '-'}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Blocks Persisted</span>
+                            <span class="detail-value">${opp.blocks_persisted !== null ? opp.blocks_persisted : '-'}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Token Pairs</span>
+                            <span class="detail-value">${opp.token_pairs.join(', ') || '-'}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Protocol Venues</span>
+                            <span class="detail-value">${opp.protocol_venues.join(', ') || '-'}</span>
+                        </div>
+                        ${opp.competitor_tx_hash ? `
+                        <div class="detail-item">
+                            <span class="detail-label">Competitor TX</span>
+                            <span class="detail-value tx-link">
+                                <a href="https://etherscan.io/tx/${opp.competitor_tx_hash}" target="_blank" rel="noopener">
+                                    ${formatTxHash(opp.competitor_tx_hash)}
+                                </a>
+                            </span>
+                        </div>
+                        ` : ''}
+                        ${opp.execution_tx_hash ? `
+                        <div class="detail-item">
+                            <span class="detail-label">Our Execution TX</span>
+                            <span class="detail-value tx-link">
+                                <a href="https://etherscan.io/tx/${opp.execution_tx_hash}" target="_blank" rel="noopener">
+                                    ${formatTxHash(opp.execution_tx_hash)}
+                                </a>
+                            </span>
+                        </div>
+                        ` : ''}
+                    </div>
+                </section>
+
+                ${buildSimulationSection(data.simulation_result)}
+
+                ${buildExecutionsSection(data.executions)}
+
+                ${buildRelatedSection(data.related_opportunities)}
+            `;
+        }
+
+        function buildSimulationSection(simulation) {
+            if (!simulation) {
+                return `
+                    <section class="card">
+                        <h2>Simulation Results</h2>
+                        <p class="empty">No simulation was run for this opportunity.</p>
+                    </section>
+                `;
+            }
+
+            return `
+                <section class="card">
+                    <h2>Simulation Results</h2>
+                    <div class="detail-grid">
+                        <div class="detail-item">
+                            <span class="detail-label">Profitable</span>
+                            <span class="detail-value ${simulation.profitable ? 'profit' : 'loss'}">
+                                ${simulation.profitable ? 'Yes' : 'No'}
+                            </span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Expected Profit</span>
+                            <span class="detail-value">${formatEth(simulation.expected_profit_eth)}</span>
+                        </div>
+                        <div class="detail-item">
+                            <span class="detail-label">Gas Estimate</span>
+                            <span class="detail-value">${simulation.gas_estimate.toLocaleString()}</span>
+                        </div>
+                        ${simulation.revert_reason ? `
+                        <div class="detail-item">
+                            <span class="detail-label">Revert Reason</span>
+                            <span class="detail-value loss">${simulation.revert_reason}</span>
+                        </div>
+                        ` : ''}
+                    </div>
+                    ${simulation.raw_result ? `
+                    <details style="margin-top: 1rem;">
+                        <summary>Raw Simulation Data</summary>
+                        <div class="json-display">${JSON.stringify(simulation.raw_result, null, 2)}</div>
+                    </details>
+                    ` : ''}
+                </section>
+            `;
+        }
+
+        function buildExecutionsSection(executions) {
+            if (!executions || executions.length === 0) {
+                return `
+                    <section class="card">
+                        <h2>Executions</h2>
+                        <p class="empty">No executions recorded for this opportunity.</p>
+                    </section>
+                `;
+            }
+
+            const rows = executions.map(exec => `
+                <tr>
+                    <td>
+                        <span class="badge badge-${exec.status}">${exec.status}</span>
+                    </td>
+                    <td class="tx-link">
+                        <a href="https://etherscan.io/tx/${exec.tx_hash}" target="_blank" rel="noopener">
+                            ${formatTxHash(exec.tx_hash)}
+                        </a>
+                    </td>
+                    <td>${exec.block_number ? exec.block_number.toLocaleString() : '-'}</td>
+                    <td>${exec.gas_price_gwei.toFixed(2)} gwei</td>
+                    <td>${exec.gas_used ? exec.gas_used.toLocaleString() : '-'}</td>
+                    <td class="${(exec.net_profit_eth || 0) >= 0 ? 'profit' : 'loss'}">
+                        ${exec.net_profit_eth !== null ? formatEth(exec.net_profit_eth) : '-'}
+                    </td>
+                    <td>${exec.slippage_bps !== null ? (exec.slippage_bps / 100).toFixed(2) + '%' : '-'}</td>
+                    <td title="${exec.submitted_at_formatted}">${formatTimeAgo(exec.submitted_at)}</td>
+                </tr>
+                ${exec.error_message ? `
+                <tr>
+                    <td colspan="8" class="loss" style="font-size: 0.875rem;">
+                        Error: ${exec.error_message}
+                    </td>
+                </tr>
+                ` : ''}
+            `).join('');
+
+            return `
+                <section class="card">
+                    <h2>Executions (${executions.length})</h2>
+                    <div style="overflow-x: auto;">
+                        <table>
+                            <thead>
+                                <tr>
+                                    <th>Status</th>
+                                    <th>TX Hash</th>
+                                    <th>Block</th>
+                                    <th>Gas Price</th>
+                                    <th>Gas Used</th>
+                                    <th>Net Profit</th>
+                                    <th>Slippage</th>
+                                    <th>Submitted</th>
+                                </tr>
+                            </thead>
+                            <tbody>${rows}</tbody>
+                        </table>
+                    </div>
+                </section>
+            `;
+        }
+
+        function buildRelatedSection(related) {
+            if (!related || related.length === 0) {
+                return `
+                    <section class="card">
+                        <h2>Related Opportunities</h2>
+                        <p class="empty">No related opportunities found.</p>
+                    </section>
+                `;
+            }
+
+            const cards = related.map(opp => `
+                <a href="/opportunity/${opp.id}" class="related-card">
+                    <h4>#${opp.id} - ${formatTypeName(opp.opportunity_type)}</h4>
+                    <p>Profit: ${formatEth(opp.estimated_net_profit_eth)}</p>
+                    <p>Block: ${opp.block_number_detected.toLocaleString()}</p>
+                    <p>${formatTimeAgo(opp.timestamp)}</p>
+                </a>
+            `).join('');
+
+            return `
+                <section class="card">
+                    <h2>Related Opportunities</h2>
+                    <div class="related-grid">${cards}</div>
+                </section>
+            `;
+        }
+
+        // Formatting helpers
+        function formatEth(value) {
+            if (value === null || value === undefined) return '-';
+            if (Math.abs(value) < 0.0001) return '< 0.0001 ETH';
+            return value.toFixed(6) + ' ETH';
+        }
+
+        function formatTypeName(type) {
+            if (!type) return 'Unknown';
+            return type.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        }
+
+        function formatTimeAgo(timestamp) {
+            const seconds = Math.floor((Date.now() - timestamp) / 1000);
+            if (seconds < 60) return `${seconds}s ago`;
+            if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+            if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+            return `${Math.floor(seconds / 86400)}d ago`;
+        }
+
+        function formatTxHash(hash) {
+            if (!hash) return '-';
+            return hash.substring(0, 10) + '...' + hash.substring(hash.length - 8);
+        }
+    </script>
+</body>
+</html>

@@ -1,0 +1,32 @@
+# Build artifacts
+/target
+*.rs.bk
+
+# Environment and secrets
+.env
+*.pem
+*.key
+
+# Database
+*.db
+*.db-shm
+*.db-wal
+data/
+
+# Logs
+logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo lock (optional - include if this is an application)
+# Cargo.lock

@@ -1,0 +1,157 @@
+# MEV Monitor Configuration
+# ===========================
+# This file contains all configuration options for the longtail MEV monitor.
+# Environment variables can override these settings (see comments for variable names).
+
+# Ethereum Network Configuration
+[ethereum]
+# HTTP RPC endpoint (env: ETH_RPC_URL)
+http_rpc_url = "http://localhost:8545"
+
+# WebSocket RPC endpoint for real-time subscriptions (env: ETH_WS_URL)
+ws_rpc_url = "ws://localhost:8546"
+
+# Chain ID: 1 = mainnet, 5 = goerli, 11155111 = sepolia (env: CHAIN_ID)
+chain_id = 1
+
+# Request timeout in seconds
+request_timeout_secs = 30
+
+# Maximum retries for failed RPC requests
+max_retries = 3
+
+# Delay between retries in milliseconds
+retry_delay_ms = 1000
+
+# Number of block confirmations to wait
+confirmations = 1
+
+# Database Configuration
+[database]
+# SQLite database file path (env: DATABASE_PATH)
+path = "data/mev_monitor.db"
+
+# Maximum number of database connections
+max_connections = 10
+
+# Connection timeout in seconds
+connection_timeout_secs = 30
+
+# Enable Write-Ahead Logging for better concurrency
+enable_wal = true
+
+# Run database migrations on startup
+run_migrations = true
+
+# Monitoring Configuration
+[monitoring]
+# Enable mempool (pending transaction) monitoring
+mempool_enabled = true
+
+# Enable new block monitoring
+block_enabled = true
+
+# Enable DEX swap monitoring
+dex_enabled = true
+
+# DEX router addresses to monitor for swaps
+dex_routers = [
+    "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D",  # Uniswap V2 Router
+    "0xE592427A0AEce92De3Edee1F18E0157C05861564",  # Uniswap V3 SwapRouter
+    "0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45",  # Uniswap V3 SwapRouter02
+    "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F",  # SushiSwap Router
+    "0xDef1C0ded9bec7F1a1670819833240f027b25EfF",  # 0x Exchange Proxy
+]
+
+# Minimum profit threshold in ETH to consider an opportunity
+min_profit_eth = 0.01
+
+# Token whitelist - only monitor these tokens (empty = all tokens)
+token_whitelist = []
+
+# Token blacklist - never monitor these tokens
+token_blacklist = [
+    # Add known honeypot or scam tokens here
+]
+
+# Maximum gas price willing to pay in gwei
+max_gas_price_gwei = 500
+
+# Polling interval for HTTP provider in milliseconds
+poll_interval_ms = 100
+
+# Execution Configuration
+[execution]
+# Enable actual transaction execution (DANGER: will spend real funds)
+enabled = true
+
+# Dry run mode - simulate transactions but don't submit
+dry_run = false
+
+# Private key for signing (RECOMMENDED: use PRIVATE_KEY env var instead)
+# private_key = ""
+
+# Flashbots relay URL (env: FLASHBOTS_RELAY_URL)
+flashbots_relay_url = "https://relay.flashbots.net"
+
+# Use Flashbots for MEV protection
+use_flashbots = false
+
+# Maximum priority fee (tip) in gwei
+max_priority_fee_gwei = 3
+
+# Gas limit multiplier (1.2 = add 20% buffer to estimated gas)
+gas_limit_multiplier = 1.2
+
+# Slippage tolerance as percentage (0.5 = 0.5%)
+slippage_tolerance = 0.5
+
+# Transaction deadline in seconds
+deadline_secs = 300
+
+# Dashboard Configuration
+[dashboard]
+# Enable web dashboard and API
+enabled = true
+
+# Dashboard host address (env: DASHBOARD_HOST)
+host = "127.0.0.1"
+
+# Dashboard port (env: DASHBOARD_PORT)
+port = 8080
+
+# Enable CORS for API access
+enable_cors = true
+
+# Allowed CORS origins (empty = allow all)
+cors_origins = []
+
+# API rate limit (requests per minute)
+rate_limit_per_minute = 60
+
+# Logging Configuration
+[logging]
+# Log level: trace, debug, info, warn, error (env: LOG_LEVEL)
+level = "info"
+
+# Log format: json, pretty (env: LOG_FORMAT)
+format = "pretty"
+
+# Enable logging to file
+file_enabled = true
+
+# Log file path
+file_path = "logs/mev_monitor.log"
+
+# Enable colored output (terminal only)
+colored = true
+
+# Include timestamps in logs
+timestamps = true
+
+# Include module path in logs
+include_target = true
+
+# Contract addresses (deployed)
+flashloan_contract = "0x2Cde9973A280e6aa9C1E9E94408b955656728018"
+sandwich_contract = "0xf8c12770b176e0d6677a95887d37462a03AE4F87"
