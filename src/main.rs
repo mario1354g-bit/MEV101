@@ -4,11 +4,14 @@ mod error;
 use std::sync::Arc;
 use std::time::Duration;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
+use alloy::sol;
 use alloy::sol_types::SolCall;
 use alloy::transports::http::{Client, Http};
 use alloy::transports::Transport;
+use alloy::network::{EthereumWallet, TransactionBuilder, TxSignerSync};
+use alloy::signers::local::PrivateKeySigner;
 #[cfg(feature = "dashboard")]
 use axum::{
     routing::get,
@@ -85,6 +88,26 @@ pub struct PendingTransaction {
     pub detected_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Swap step for flash loan arbitrage execution
+/// Matches the Solidity struct in FlashloanArbitrage contract
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SwapStep {
+    /// Protocol identifier: 1=UniV2, 2=UniV3, 3=Balancer, 4=Curve
+    pub protocol: u8,
+    /// Router/pool address for the swap
+    pub router: Address,
+    /// Input token address
+    pub token_in: Address,
+    /// Output token address
+    pub token_out: Address,
+    /// Protocol-specific swap data (e.g., pool fee for UniV3)
+    pub swap_data: Vec<u8>,
+    /// Amount to swap (0 = use all available balance)
+    pub amount_in: U256,
+    /// Minimum output amount (slippage protection)
+    pub min_amount_out: U256,
+}
+
 /// MEV opportunity data
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MevOpportunity {
@@ -96,6 +119,30 @@ pub struct MevOpportunity {
     pub net_profit_wei: String,
     pub detected_at: chrono::DateTime<chrono::Utc>,
     pub status: String,
+    /// Flash loan token address (token to borrow)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash_loan_token: Option<Address>,
+    /// Flash loan amount in wei
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flash_loan_amount: Option<U256>,
+    /// Swap steps for the arbitrage execution
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub swap_steps: Option<Vec<SwapStep>>,
+    /// Buy DEX name (for logging)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buy_dex: Option<String>,
+    /// Sell DEX name (for logging)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sell_dex: Option<String>,
+    /// Buy router address
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub buy_router: Option<Address>,
+    /// Sell router address
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sell_router: Option<Address>,
+    /// Token pair name (e.g., "WETH/USDC")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pair_name: Option<String>,
 }
 
 fn main() -> Result<(), MevError> {
@@ -615,49 +662,131 @@ async fn try_create_ws_provider(url: &str) -> Result<WsProvider, MevError> {
 
 /// Run mempool monitor - subscribes to pending transactions via WebSocket
 async fn run_mempool_monitor(state: Arc<AppState>) -> Result<(), MevError> {
+    use futures::StreamExt;
 
     let poll_interval = std::time::Duration::from_millis(state.config.monitoring.poll_interval_ms * 10);
-    let pending_tx_count: u64 = 0;
+    let mut pending_tx_count: u64 = 0;
     let mut last_log = std::time::Instant::now();
 
     info!("Mempool monitor: attempting to subscribe to pending transactions");
 
-    // Try to subscribe to pending transactions via WebSocket
-    // Note: This may not work with all providers (e.g., Infura free tier doesn't support txpool)
+    // Check if we have a WebSocket provider for subscriptions
+    if let Some(ref ws_provider) = state.ws_provider {
+        info!("Mempool monitor: WebSocket provider available, attempting subscription");
+
+        // Try to subscribe to pending transactions
+        match ws_provider.subscribe_pending_transactions().await {
+            Ok(subscription) => {
+                info!("Mempool monitor: Successfully subscribed to pending transactions!");
+                let mut stream = subscription.into_stream();
+
+                loop {
+                    // Log status every 30 seconds
+                    if last_log.elapsed().as_secs() >= 30 {
+                        info!(
+                            "Mempool monitor: {} pending txs seen, {} currently tracked",
+                            pending_tx_count,
+                            state.pending_txs.len()
+                        );
+                        last_log = std::time::Instant::now();
+                    }
+
+                    // Use select to handle both stream events and periodic status logging
+                    tokio::select! {
+                        tx_hash = stream.next() => {
+                            match tx_hash {
+                                Some(hash) => {
+                                    pending_tx_count += 1;
+                                    if pending_tx_count <= 5 || pending_tx_count % 100 == 0 {
+                                        info!("Mempool monitor: Received pending tx #{}: {:?}", pending_tx_count, hash);
+                                    }
+                                    tracing::debug!("Pending tx: {:?}", hash);
+                                }
+                                None => {
+                                    warn!("Mempool monitor: Subscription stream ended unexpectedly");
+                                    break;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(30)) => {
+                            // Periodic logging handled above
+                        }
+                    }
+                }
+
+                // If subscription ended, fall through to polling
+                warn!("Mempool monitor: Subscription ended, falling back to polling");
+            }
+            Err(e) => {
+                warn!(
+                    "Mempool monitor: Failed to subscribe to pending transactions: {}. \
+                    This is expected for providers that don't support newPendingTransactions \
+                    (e.g., some Alchemy tiers, Infura free tier). Falling back to polling.",
+                    e
+                );
+            }
+        }
+    } else {
+        warn!("Mempool monitor: No WebSocket provider available, using polling mode");
+    }
+
+    // Fallback: Poll pending block for transactions
+    info!("Mempool monitor: Using polling mode for pending transactions");
+
     loop {
         // Log status every 30 seconds
         if last_log.elapsed().as_secs() >= 30 {
             info!(
-                "Mempool monitor: {} pending txs seen, {} currently tracked",
+                "Mempool monitor (polling): {} pending txs seen, {} currently tracked",
                 pending_tx_count,
                 state.pending_txs.len()
             );
             last_log = std::time::Instant::now();
         }
 
-        // Try to get txpool status (only works with nodes that support it)
-        // Most public RPCs don't support this, so we'll just poll and log
+        // Try to get pending block with full transactions
+        // This works better with some providers than subscriptions
         match state.http_provider.get_block(
-            alloy::eips::BlockId::latest(),
-            alloy::rpc::types::BlockTransactionsKind::Hashes
+            alloy::eips::BlockId::pending(),
+            alloy::rpc::types::BlockTransactionsKind::Full
         ).await {
             Ok(Some(block)) => {
                 let tx_count = match &block.transactions {
-                    alloy::rpc::types::BlockTransactions::Hashes(hashes) => hashes.len(),
-                    alloy::rpc::types::BlockTransactions::Full(txs) => txs.len(),
+                    alloy::rpc::types::BlockTransactions::Full(txs) => {
+                        let count = txs.len();
+                        if count > 0 {
+                            pending_tx_count += count as u64;
+                            info!(
+                                "Mempool monitor (polling): Found {} txs in pending block (total seen: {})",
+                                count,
+                                pending_tx_count
+                            );
+                        }
+                        count
+                    }
+                    alloy::rpc::types::BlockTransactions::Hashes(hashes) => {
+                        let count = hashes.len();
+                        if count > 0 {
+                            pending_tx_count += count as u64;
+                            tracing::debug!("Pending block has {} tx hashes", count);
+                        }
+                        count
+                    }
                     _ => 0,
                 };
 
                 if tx_count > 0 {
                     tracing::debug!(
-                        "Latest block has {} transactions",
+                        "Pending block has {} transactions",
                         tx_count
                     );
                 }
             }
-            Ok(None) => {}
+            Ok(None) => {
+                tracing::debug!("No pending block available");
+            }
             Err(e) => {
-                tracing::debug!("Failed to get latest block: {}", e);
+                tracing::debug!("Failed to get pending block: {}", e);
             }
         }
 
@@ -726,6 +855,189 @@ struct DexPair {
     address: Address,
     dex_type: DexType,
 }
+
+/// Price data with liquidity information for opportunity validation
+#[derive(Debug, Clone)]
+struct DexPriceData {
+    dex: &'static str,
+    price: f64,
+    /// Liquidity in USD equivalent (reserve0 + reserve1 converted to USD)
+    liquidity_usd: f64,
+    /// Reserve of token0 (raw, adjusted for decimals) - used for advanced slippage calculations
+    #[allow(dead_code)]
+    reserve0: f64,
+    /// Reserve of token1 (raw, adjusted for decimals) - used for advanced slippage calculations
+    #[allow(dead_code)]
+    reserve1: f64,
+    /// Pool/pair address for this DEX
+    #[allow(dead_code)]
+    pool_address: Address,
+    /// DEX type (for protocol identification in execution)
+    dex_type: DexType,
+}
+
+/// Well-known DEX router addresses for execution
+#[allow(dead_code)]
+mod dex_routers {
+    use alloy::primitives::Address;
+
+    /// Uniswap V2 Router02
+    pub const UNISWAP_V2_ROUTER: &str = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D";
+    /// Uniswap V3 SwapRouter
+    pub const UNISWAP_V3_ROUTER: &str = "0xE592427A0AEce92De3Edee1F18E0157C05861564";
+    /// SushiSwap Router
+    pub const SUSHISWAP_ROUTER: &str = "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F";
+    /// Balancer V2 Vault
+    pub const BALANCER_V2_VAULT: &str = "0xBA12222222228d8Ba445958a75a0704d566BF2C8";
+    /// Curve Router (for meta-pools)
+    pub const CURVE_ROUTER: &str = "0x99a58482BD75cbab83b27EC03CA68fF489b5788f";
+
+    /// Get router address for a given DEX name
+    pub fn get_router_address(dex_name: &str) -> Option<Address> {
+        match dex_name.to_lowercase().as_str() {
+            "univ2" | "uniswap" | "uniswapv2" => UNISWAP_V2_ROUTER.parse().ok(),
+            "univ3" | "uniswapv3" => UNISWAP_V3_ROUTER.parse().ok(),
+            "sushi" | "sushiswap" => SUSHISWAP_ROUTER.parse().ok(),
+            "balancer" | "balancerv2" => BALANCER_V2_VAULT.parse().ok(),
+            "curve" => CURVE_ROUTER.parse().ok(),
+            // For Fraxswap, ShibaSwap, etc., they typically use the Uniswap V2 interface
+            "frax" | "fraxswap" | "shiba" | "shibaswap" | "pancake" | "pancakeswap" => {
+                // These need their specific router addresses in production
+                // For now, return None to indicate execution is not supported
+                None
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Well-known token addresses on Ethereum mainnet
+#[allow(dead_code)]
+mod tokens {
+    use alloy::primitives::Address;
+
+    pub const WETH: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
+    pub const USDC: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+    pub const USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
+    pub const DAI: &str = "0x6B175474E89094C44Da98b954EesC8E1d7c2F8ad";
+    pub const WBTC: &str = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599";
+
+    /// Get token address from symbol (from pair name like "WETH/USDC")
+    pub fn get_token_address(symbol: &str) -> Option<Address> {
+        match symbol.to_uppercase().as_str() {
+            "WETH" | "ETH" => WETH.parse().ok(),
+            "USDC" => USDC.parse().ok(),
+            "USDT" => USDT.parse().ok(),
+            "DAI" => DAI.parse().ok(),
+            "WBTC" | "BTC" => WBTC.parse().ok(),
+            _ => None,
+        }
+    }
+
+    /// Parse a pair name like "WETH/USDC" and return (token0, token1) addresses
+    pub fn parse_pair_tokens(pair_name: &str) -> Option<(Address, Address)> {
+        let parts: Vec<&str> = pair_name.split('/').collect();
+        if parts.len() != 2 {
+            return None;
+        }
+        let token0 = get_token_address(parts[0])?;
+        let token1 = get_token_address(parts[1])?;
+        Some((token0, token1))
+    }
+}
+
+/// Build swap steps for a simple two-leg arbitrage (buy on one DEX, sell on another)
+#[allow(dead_code)]
+fn build_arbitrage_swap_steps(
+    buy_data: &DexPriceData,
+    sell_data: &DexPriceData,
+    token0: Address,
+    token1: Address,
+    flash_loan_amount: U256,
+    slippage_tolerance_bps: u64,  // in basis points (100 = 1%)
+) -> Option<Vec<SwapStep>> {
+    // Get router addresses
+    let buy_router = dex_routers::get_router_address(buy_data.dex)?;
+    let sell_router = dex_routers::get_router_address(sell_data.dex)?;
+
+    // Calculate minimum amounts with slippage protection
+    // For buy step: we're buying token1 with token0
+    // min_out = expected_out * (1 - slippage)
+    let slippage_factor = 10000 - slippage_tolerance_bps;
+
+    // Step 1: Buy token1 with the flash-loaned token0
+    // Use 0 for amountIn to indicate "use all available"
+    let buy_step = SwapStep {
+        protocol: get_protocol_id(buy_data.dex),
+        router: buy_router,
+        token_in: token0,
+        token_out: token1,
+        swap_data: match buy_data.dex_type {
+            DexType::UniswapV3 { fee_tier } => {
+                // For V3, swap_data includes the fee tier
+                fee_tier.to_be_bytes().to_vec()
+            }
+            _ => Vec::new(),
+        },
+        amount_in: flash_loan_amount,
+        min_amount_out: U256::from(0), // Will be calculated by contract or we compute expected output
+    };
+
+    // Step 2: Sell token1 back to token0
+    // We need to end up with more token0 than we borrowed
+    let sell_step = SwapStep {
+        protocol: get_protocol_id(sell_data.dex),
+        router: sell_router,
+        token_in: token1,
+        token_out: token0,
+        swap_data: match sell_data.dex_type {
+            DexType::UniswapV3 { fee_tier } => {
+                fee_tier.to_be_bytes().to_vec()
+            }
+            _ => Vec::new(),
+        },
+        amount_in: U256::from(0), // Use all token1 from step 1
+        min_amount_out: flash_loan_amount * U256::from(slippage_factor) / U256::from(10000), // At least get back what we borrowed
+    };
+
+    Some(vec![buy_step, sell_step])
+}
+
+/// Validation result for arbitrage opportunities
+#[derive(Debug, Clone, PartialEq)]
+enum OpportunityValidation {
+    /// Opportunity validated - sufficient liquidity and profitable after slippage
+    Validated {
+        simulated_profit_usd: f64,
+        gas_cost_usd: f64,
+        net_profit_usd: f64,
+    },
+    /// Low liquidity - pool doesn't have enough liquidity for profitable execution
+    LowLiquidity {
+        buy_liquidity_usd: f64,
+        sell_liquidity_usd: f64,
+        min_required_usd: f64,
+    },
+    /// High slippage - actual output after slippage makes trade unprofitable
+    HighSlippage {
+        expected_profit_pct: f64,
+        actual_profit_pct: f64,
+        slippage_pct: f64,
+    },
+    /// Gas costs exceed profit
+    GasExceedsProfit {
+        gross_profit_usd: f64,
+        gas_cost_usd: f64,
+    },
+}
+
+/// Constants for opportunity validation
+const MIN_LIQUIDITY_USD: f64 = 100_000.0;  // $100k minimum liquidity per pool
+const TRADE_SIZE_ETH: f64 = 10.0;          // Simulate 10 ETH trade size
+const ETH_PRICE_USD: f64 = 2500.0;         // Approximate ETH price for USD conversion
+const GAS_LIMIT_SWAP: u64 = 250_000;       // Gas limit for a typical DEX swap
+const BASE_FEE_GWEI: f64 = 30.0;           // Base fee estimate in gwei
+const PRIORITY_FEE_GWEI: f64 = 2.0;        // Priority fee in gwei
 
 impl TradingPair {
     fn new(name: &'static str, token0_decimals: u8, token1_decimals: u8, pairs: Vec<(&'static str, &'static str)>) -> Self {
@@ -1388,15 +1700,15 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                 continue; // Need at least 2 DEXes to compare
             }
 
-            // Fetch prices from all DEXes for this pair
-            let mut dex_prices: Vec<(&str, f64)> = Vec::new();
+            // Fetch prices and liquidity from all DEXes for this pair
+            let mut dex_prices: Vec<DexPriceData> = Vec::new();
 
             for dex_pair in &pair.pairs {
-                // Use the unified fetch_dex_price function that handles V2, V3, Curve, Balancer
-                match fetch_dex_price(&*state.http_provider, dex_pair, pair.token0_decimals, pair.token1_decimals).await {
-                    Ok(price) => {
-                        if price > 0.0 && price.is_finite() {
-                            dex_prices.push((dex_pair.dex, price));
+                // Use the unified fetch_dex_price_with_liquidity function that handles V2, V3, Curve, Balancer
+                match fetch_dex_price_with_liquidity(&*state.http_provider, dex_pair, pair.token0_decimals, pair.token1_decimals).await {
+                    Ok(price_data) => {
+                        if price_data.price > 0.0 && price_data.price.is_finite() {
+                            dex_prices.push(price_data);
                         }
                     }
                     Err(e) => {
@@ -1408,15 +1720,13 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
             // Find max spread across all DEX combinations
             if dex_prices.len() >= 2 {
                 let mut max_spread = 0.0f64;
-                let mut best_buy_dex = "";
-                let mut best_sell_dex = "";
-                let mut best_buy_price = 0.0;
-                let mut best_sell_price = 0.0;
+                let mut best_buy_idx: Option<usize> = None;
+                let mut best_sell_idx: Option<usize> = None;
 
                 for i in 0..dex_prices.len() {
                     for j in (i + 1)..dex_prices.len() {
-                        let (dex_a, price_a) = dex_prices[i];
-                        let (dex_b, price_b) = dex_prices[j];
+                        let price_a = dex_prices[i].price;
+                        let price_b = dex_prices[j].price;
 
                         let spread = if price_a > price_b {
                             (price_a - price_b) / price_b * 100.0
@@ -1427,15 +1737,11 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                         if spread > max_spread {
                             max_spread = spread;
                             if price_a > price_b {
-                                best_buy_dex = dex_b;
-                                best_sell_dex = dex_a;
-                                best_buy_price = price_b;
-                                best_sell_price = price_a;
+                                best_buy_idx = Some(j);
+                                best_sell_idx = Some(i);
                             } else {
-                                best_buy_dex = dex_a;
-                                best_sell_dex = dex_b;
-                                best_buy_price = price_a;
-                                best_sell_price = price_b;
+                                best_buy_idx = Some(i);
+                                best_sell_idx = Some(j);
                             }
                         }
                     }
@@ -1450,26 +1756,135 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                     continue;
                 }
 
-                // Log spreads above 0.05%
+                // Only process spreads above 0.05%
                 if max_spread > 0.05 {
+                    let buy_data = &dex_prices[best_buy_idx.unwrap()];
+                    let sell_data = &dex_prices[best_sell_idx.unwrap()];
+
+                    // Validate opportunity with liquidity check and slippage simulation
+                    let validation = validate_arbitrage_opportunity(
+                        buy_data,
+                        sell_data,
+                        max_spread,
+                        pair.name,
+                    );
+
+                    // Determine status based on validation
+                    let (status, log_prefix) = match &validation {
+                        OpportunityValidation::Validated { net_profit_usd, .. } => {
+                            if *net_profit_usd > 100.0 {
+                                ("VALIDATED_HIGH".to_string(), "VALIDATED")
+                            } else {
+                                ("VALIDATED".to_string(), "VALIDATED")
+                            }
+                        }
+                        OpportunityValidation::LowLiquidity { .. } => {
+                            ("LOW_LIQUIDITY".to_string(), "LOW_LIQUIDITY")
+                        }
+                        OpportunityValidation::HighSlippage { .. } => {
+                            ("HIGH_SLIPPAGE".to_string(), "HIGH_SLIPPAGE")
+                        }
+                        OpportunityValidation::GasExceedsProfit { .. } => {
+                            ("GAS_EXCEEDS_PROFIT".to_string(), "GAS_EXCEEDS_PROFIT")
+                        }
+                    };
+
                     opportunities_found += 1;
                     state.stats.opportunities_detected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    info!(
-                        "[{}] Spread: {:.4}% | Buy@{}: {:.6}, Sell@{}: {:.6}",
-                        pair.name, max_spread, best_buy_dex, best_buy_price, best_sell_dex, best_sell_price
-                    );
+
+                    // Log based on validation status
+                    match &validation {
+                        OpportunityValidation::Validated { simulated_profit_usd, gas_cost_usd, net_profit_usd } => {
+                            info!(
+                                "[{}] [{}] Spread: {:.4}% | Buy@{}: {:.6} (${:.0}k liq), Sell@{}: {:.6} (${:.0}k liq) | Net: ${:.2} (gross ${:.2} - gas ${:.2})",
+                                log_prefix, pair.name, max_spread,
+                                buy_data.dex, buy_data.price, buy_data.liquidity_usd / 1000.0,
+                                sell_data.dex, sell_data.price, sell_data.liquidity_usd / 1000.0,
+                                net_profit_usd, simulated_profit_usd, gas_cost_usd
+                            );
+                        }
+                        OpportunityValidation::LowLiquidity { buy_liquidity_usd, sell_liquidity_usd, min_required_usd } => {
+                            tracing::debug!(
+                                "[{}] [{}] Spread: {:.4}% | Buy@{} (${:.0}k), Sell@{} (${:.0}k) | Min required: ${:.0}k",
+                                log_prefix, pair.name, max_spread,
+                                buy_data.dex, buy_liquidity_usd / 1000.0,
+                                sell_data.dex, sell_liquidity_usd / 1000.0,
+                                min_required_usd / 1000.0
+                            );
+                        }
+                        OpportunityValidation::HighSlippage { expected_profit_pct, actual_profit_pct, slippage_pct } => {
+                            tracing::debug!(
+                                "[{}] [{}] Spread: {:.4}% | Expected: {:.2}%, Actual: {:.2}%, Slippage: {:.2}%",
+                                log_prefix, pair.name, max_spread,
+                                expected_profit_pct, actual_profit_pct, slippage_pct
+                            );
+                        }
+                        OpportunityValidation::GasExceedsProfit { gross_profit_usd, gas_cost_usd } => {
+                            tracing::debug!(
+                                "[{}] [{}] Spread: {:.4}% | Gross profit: ${:.2}, Gas cost: ${:.2}",
+                                log_prefix, pair.name, max_spread,
+                                gross_profit_usd, gas_cost_usd
+                            );
+                        }
+                    }
 
                     // Store opportunity in cache for dashboard
                     let opp_id = format!("{}-{}", pair.name, chrono::Utc::now().timestamp_millis());
+                    let (estimated_profit, gas_cost, net_profit) = match &validation {
+                        OpportunityValidation::Validated { simulated_profit_usd, gas_cost_usd, net_profit_usd } => {
+                            (format!("{:.2}", simulated_profit_usd), format!("{:.2}", gas_cost_usd), format!("{:.2}", net_profit_usd))
+                        }
+                        _ => (format!("{:.4}%", max_spread), "0".to_string(), format!("{:.4}%", max_spread))
+                    };
+
+                    // Build execution data for validated opportunities
+                    let (flash_loan_token, flash_loan_amount, swap_steps, buy_router, sell_router) =
+                        if matches!(&validation, OpportunityValidation::Validated { .. }) {
+                            // Try to parse token addresses from pair name
+                            if let Some((token0, token1)) = tokens::parse_pair_tokens(pair.name) {
+                                // Calculate flash loan amount based on trade size
+                                let trade_size_eth = TRADE_SIZE_ETH;
+                                let flash_loan_amt = U256::from((trade_size_eth * 1e18) as u64);
+
+                                // Build swap steps
+                                let slippage_bps = (state.config.execution.slippage_tolerance * 100.0) as u64;
+                                let steps = build_arbitrage_swap_steps(
+                                    buy_data,
+                                    sell_data,
+                                    token0,
+                                    token1,
+                                    flash_loan_amt,
+                                    slippage_bps,
+                                );
+
+                                let buy_rtr = dex_routers::get_router_address(buy_data.dex);
+                                let sell_rtr = dex_routers::get_router_address(sell_data.dex);
+
+                                (Some(token0), Some(flash_loan_amt), steps, buy_rtr, sell_rtr)
+                            } else {
+                                (None, None, None, None, None)
+                            }
+                        } else {
+                            (None, None, None, None, None)
+                        };
+
                     state.opportunities.insert(opp_id.clone(), MevOpportunity {
                         id: opp_id,
                         opportunity_type: "price_discrepancy".to_string(),
-                        target_tx: format!("{} Buy@{} Sell@{}", pair.name, best_buy_dex, best_sell_dex),
-                        estimated_profit_wei: format!("{:.6}", max_spread),
-                        estimated_gas_cost_wei: "0".to_string(),
-                        net_profit_wei: format!("{:.4}%", max_spread),
+                        target_tx: format!("{} Buy@{} Sell@{}", pair.name, buy_data.dex, sell_data.dex),
+                        estimated_profit_wei: estimated_profit,
+                        estimated_gas_cost_wei: gas_cost,
+                        net_profit_wei: net_profit,
                         detected_at: chrono::Utc::now(),
-                        status: if max_spread > 0.5 { "high_priority".to_string() } else { "detected".to_string() },
+                        status,
+                        flash_loan_token,
+                        flash_loan_amount,
+                        swap_steps,
+                        buy_dex: Some(buy_data.dex.to_string()),
+                        sell_dex: Some(sell_data.dex.to_string()),
+                        buy_router,
+                        sell_router,
+                        pair_name: Some(pair.name.to_string()),
                     });
 
                     // Keep only last 500 opportunities and remove stale ones (>5 min old)
@@ -1490,23 +1905,27 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                             state.opportunities.remove(entry.key());
                         }
                     }
-                }
 
-                // Alert on significant opportunities (0.3% - 10%)
-                if max_spread > 0.3 {
-                    warn!(
-                        "ARBITRAGE OPPORTUNITY: {} - {:.4}% spread (Buy@{}: {:.6}, Sell@{}: {:.6})",
-                        pair.name, max_spread, best_buy_dex, best_buy_price, best_sell_dex, best_sell_price
-                    );
-                }
+                    // Alert on significant VALIDATED opportunities (0.3% - 10%)
+                    if max_spread > 0.3 {
+                        if let OpportunityValidation::Validated { net_profit_usd, .. } = &validation {
+                            warn!(
+                                "VALIDATED ARBITRAGE: {} - {:.4}% spread | Net profit: ${:.2} (Buy@{}: {:.6}, Sell@{}: {:.6})",
+                                pair.name, max_spread, net_profit_usd, buy_data.dex, buy_data.price, sell_data.dex, sell_data.price
+                            );
+                        }
+                    }
 
-                // High priority alerts (0.5% - 10%)
-                if max_spread > 0.5 {
-                    state.stats.high_spread_alerts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    error!(
-                        "HIGH SPREAD ALERT: {} - {:.4}% - BUY {} @ {} -> SELL @ {}",
-                        pair.name, max_spread, best_buy_dex, best_buy_price, best_sell_dex
-                    );
+                    // High priority alerts for validated opportunities (0.5% - 10%)
+                    if max_spread > 0.5 {
+                        if let OpportunityValidation::Validated { net_profit_usd, .. } = &validation {
+                            state.stats.high_spread_alerts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            error!(
+                                "HIGH PRIORITY VALIDATED: {} - {:.4}% | Net: ${:.2} - BUY {} @ {} -> SELL @ {}",
+                                pair.name, max_spread, net_profit_usd, buy_data.dex, buy_data.price, sell_data.dex
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -1684,74 +2103,8 @@ async fn fetch_balancer_v2_balances<P: Provider<T>, T: Transport + Clone>(
     Ok((decoded.tokens, decoded.balances))
 }
 
-/// Fetch price based on DEX type - unified interface
-async fn fetch_dex_price<P: Provider<T>, T: Transport + Clone>(
-    provider: &P,
-    dex_pair: &DexPair,
-    decimals0: u8,
-    decimals1: u8,
-) -> Result<f64, MevError> {
-    match dex_pair.dex_type {
-        DexType::UniswapV2 | DexType::PancakeSwap | DexType::Camelot => {
-            // V2-style AMMs use getReserves
-            let (r0, r1) = fetch_uniswap_v2_reserves(provider, dex_pair.address).await?;
-            Ok(calculate_price(r0, r1, decimals0, decimals1))
-        }
-        DexType::UniswapV3 { .. } => {
-            // V3-style pools use slot0 for price
-            let sqrt_price = fetch_uniswap_v3_price(provider, dex_pair.address).await?;
-            Ok(calculate_v3_price(sqrt_price, decimals0, decimals1))
-        }
-        DexType::Curve => {
-            // For Curve, try price_oracle first (for crypto pools), then virtual_price
-            match fetch_curve_price_oracle(provider, dex_pair.address, 0).await {
-                Ok(price) => {
-                    let price_f64 = price.to_string().parse::<f64>().unwrap_or(0.0);
-                    // Curve prices are typically 18 decimals
-                    Ok(price_f64 / 1e18)
-                }
-                Err(_) => {
-                    // Fallback to virtual price for stablecoin pools
-                    match fetch_curve_virtual_price(provider, dex_pair.address).await {
-                        Ok(vp) => {
-                            let vp_f64 = vp.to_string().parse::<f64>().unwrap_or(0.0);
-                            Ok(vp_f64 / 1e18)
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            }
-        }
-        DexType::BalancerV2 => {
-            // For Balancer V2, we need to extract pool ID from the address
-            // The first 20 bytes of the pool ID is typically the pool address
-            let mut pool_id = [0u8; 32];
-            pool_id[..20].copy_from_slice(dex_pair.address.as_slice());
-
-            match fetch_balancer_v2_balances(provider, pool_id).await {
-                Ok((_tokens, balances)) => {
-                    if balances.len() >= 2 {
-                        let b0 = balances[0].to_string().parse::<f64>().unwrap_or(0.0);
-                        let b1 = balances[1].to_string().parse::<f64>().unwrap_or(0.0);
-                        if b1 > 0.0 {
-                            let decimal_adjustment = 10_f64.powi(decimals1 as i32 - decimals0 as i32);
-                            Ok((b0 / b1) * decimal_adjustment)
-                        } else {
-                            Ok(0.0)
-                        }
-                    } else {
-                        Ok(0.0)
-                    }
-                }
-                Err(_) => {
-                    // Fallback: treat as V2-style for some Balancer pools
-                    let (r0, r1) = fetch_uniswap_v2_reserves(provider, dex_pair.address).await?;
-                    Ok(calculate_price(r0, r1, decimals0, decimals1))
-                }
-            }
-        }
-    }
-}
+// Note: fetch_dex_price was replaced by fetch_dex_price_with_liquidity which includes
+// liquidity data for proper opportunity validation
 
 /// Calculate price from reserves (price of token1 in terms of token0)
 /// For USDC/WETH pair: returns price of WETH in USDC
@@ -1767,6 +2120,279 @@ fn calculate_price(reserve0: U256, reserve1: U256, decimals0: u8, decimals1: u8)
     // For USDC(6)/WETH(18): price = reserve0/reserve1 * 10^12
     let decimal_adjustment = 10_f64.powi(decimals1 as i32 - decimals0 as i32);
     (r0 / r1) * decimal_adjustment
+}
+
+/// Fetch price and liquidity data from a DEX pair
+/// Returns DexPriceData with price, liquidity in USD, and raw reserves
+async fn fetch_dex_price_with_liquidity<P: Provider<T>, T: Transport + Clone>(
+    provider: &P,
+    dex_pair: &DexPair,
+    decimals0: u8,
+    decimals1: u8,
+) -> Result<DexPriceData, MevError> {
+    match dex_pair.dex_type {
+        DexType::UniswapV2 | DexType::PancakeSwap | DexType::Camelot => {
+            // V2-style AMMs use getReserves
+            let (r0, r1) = fetch_uniswap_v2_reserves(provider, dex_pair.address).await?;
+            let price = calculate_price(r0, r1, decimals0, decimals1);
+
+            // Convert reserves to human-readable values
+            let reserve0_adjusted = r0.to_string().parse::<f64>().unwrap_or(0.0) / 10_f64.powi(decimals0 as i32);
+            let reserve1_adjusted = r1.to_string().parse::<f64>().unwrap_or(0.0) / 10_f64.powi(decimals1 as i32);
+
+            // Estimate liquidity in USD (assume token0 is the quote token or use ETH price)
+            // For pairs like WETH/X, reserve0 is often WETH
+            let liquidity_usd = estimate_liquidity_usd(reserve0_adjusted, reserve1_adjusted, price, decimals0);
+
+            Ok(DexPriceData {
+                dex: dex_pair.dex,
+                price,
+                liquidity_usd,
+                reserve0: reserve0_adjusted,
+                reserve1: reserve1_adjusted,
+                pool_address: dex_pair.address,
+                dex_type: dex_pair.dex_type.clone(),
+            })
+        }
+        DexType::UniswapV3 { .. } => {
+            // V3-style pools use slot0 for price and liquidity() for TVL
+            let sqrt_price = fetch_uniswap_v3_price(provider, dex_pair.address).await?;
+            let price = calculate_v3_price(sqrt_price, decimals0, decimals1);
+
+            // For V3, we estimate liquidity from the price and typical V3 pool TVL
+            // In production, you'd fetch the actual liquidity from the pool
+            let liquidity = fetch_uniswap_v3_liquidity(provider, dex_pair.address).await.unwrap_or(U256::ZERO);
+            let liquidity_f64 = liquidity.to_string().parse::<f64>().unwrap_or(0.0);
+
+            // V3 liquidity is a different unit - estimate USD value
+            // This is a rough approximation; in production you'd use tick-based calculations
+            let liquidity_usd = if price > 0.0 {
+                (liquidity_f64 / 1e18) * ETH_PRICE_USD * 2.0 // Rough estimate
+            } else {
+                0.0
+            };
+
+            Ok(DexPriceData {
+                dex: dex_pair.dex,
+                price,
+                liquidity_usd: liquidity_usd.min(100_000_000.0), // Cap at reasonable value
+                reserve0: 0.0, // V3 doesn't have traditional reserves
+                reserve1: 0.0,
+                pool_address: dex_pair.address,
+                dex_type: dex_pair.dex_type.clone(),
+            })
+        }
+        DexType::Curve => {
+            // For Curve, get price from oracle and estimate liquidity from balances
+            let price = match fetch_curve_price_oracle(provider, dex_pair.address, 0).await {
+                Ok(p) => p.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
+                Err(_) => {
+                    match fetch_curve_virtual_price(provider, dex_pair.address).await {
+                        Ok(vp) => vp.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
+                        Err(e) => return Err(e),
+                    }
+                }
+            };
+
+            // Curve pools typically have high liquidity - estimate based on virtual price
+            // In production, you'd call get_balances() on the pool
+            let liquidity_usd = 10_000_000.0; // Default high liquidity for Curve (they're usually deep)
+
+            Ok(DexPriceData {
+                dex: dex_pair.dex,
+                price,
+                liquidity_usd,
+                reserve0: 0.0,
+                reserve1: 0.0,
+                pool_address: dex_pair.address,
+                dex_type: dex_pair.dex_type.clone(),
+            })
+        }
+        DexType::BalancerV2 => {
+            let mut pool_id = [0u8; 32];
+            pool_id[..20].copy_from_slice(dex_pair.address.as_slice());
+
+            match fetch_balancer_v2_balances(provider, pool_id).await {
+                Ok((_tokens, balances)) => {
+                    if balances.len() >= 2 {
+                        let b0 = balances[0].to_string().parse::<f64>().unwrap_or(0.0);
+                        let b1 = balances[1].to_string().parse::<f64>().unwrap_or(0.0);
+                        let decimal_adjustment = 10_f64.powi(decimals1 as i32 - decimals0 as i32);
+                        let price = if b1 > 0.0 { (b0 / b1) * decimal_adjustment } else { 0.0 };
+
+                        let reserve0_adjusted = b0 / 10_f64.powi(decimals0 as i32);
+                        let reserve1_adjusted = b1 / 10_f64.powi(decimals1 as i32);
+                        let liquidity_usd = estimate_liquidity_usd(reserve0_adjusted, reserve1_adjusted, price, decimals0);
+
+                        Ok(DexPriceData {
+                            dex: dex_pair.dex,
+                            price,
+                            liquidity_usd,
+                            reserve0: reserve0_adjusted,
+                            reserve1: reserve1_adjusted,
+                            pool_address: dex_pair.address,
+                            dex_type: dex_pair.dex_type.clone(),
+                        })
+                    } else {
+                        Ok(DexPriceData {
+                            dex: dex_pair.dex,
+                            price: 0.0,
+                            liquidity_usd: 0.0,
+                            reserve0: 0.0,
+                            reserve1: 0.0,
+                            pool_address: dex_pair.address,
+                            dex_type: dex_pair.dex_type.clone(),
+                        })
+                    }
+                }
+                Err(_) => {
+                    // Fallback to V2-style
+                    let (r0, r1) = fetch_uniswap_v2_reserves(provider, dex_pair.address).await?;
+                    let price = calculate_price(r0, r1, decimals0, decimals1);
+                    let reserve0_adjusted = r0.to_string().parse::<f64>().unwrap_or(0.0) / 10_f64.powi(decimals0 as i32);
+                    let reserve1_adjusted = r1.to_string().parse::<f64>().unwrap_or(0.0) / 10_f64.powi(decimals1 as i32);
+                    let liquidity_usd = estimate_liquidity_usd(reserve0_adjusted, reserve1_adjusted, price, decimals0);
+
+                    Ok(DexPriceData {
+                        dex: dex_pair.dex,
+                        price,
+                        liquidity_usd,
+                        reserve0: reserve0_adjusted,
+                        reserve1: reserve1_adjusted,
+                        pool_address: dex_pair.address,
+                        dex_type: dex_pair.dex_type.clone(),
+                    })
+                }
+            }
+        }
+    }
+}
+
+/// Estimate liquidity in USD from reserves
+/// Assumes token0 is a stablecoin or ETH-like asset for pricing
+fn estimate_liquidity_usd(reserve0: f64, reserve1: f64, price: f64, decimals0: u8) -> f64 {
+    // For stablecoin pairs (decimals0 = 6, typically USDC/USDT)
+    if decimals0 == 6 {
+        // reserve0 is likely a stablecoin, so TVL ~= 2 * reserve0
+        return reserve0 * 2.0;
+    }
+
+    // For ETH pairs (decimals0 = 18, typically WETH)
+    if decimals0 == 18 {
+        // reserve0 is likely ETH, TVL ~= reserve0 * ETH_PRICE * 2
+        return reserve0 * ETH_PRICE_USD * 2.0;
+    }
+
+    // Fallback: use price to estimate
+    if price > 0.0 {
+        reserve1 * price * 2.0
+    } else {
+        0.0
+    }
+}
+
+/// Fetch liquidity from Uniswap V3 pool
+async fn fetch_uniswap_v3_liquidity<P: Provider<T>, T: Transport + Clone>(
+    provider: &P,
+    pool_address: Address,
+) -> Result<U256, MevError> {
+    use alloy::sol;
+
+    sol! {
+        function liquidity() external view returns (uint128);
+    }
+
+    let call = liquidityCall {};
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(pool_address)
+        .input(call.abi_encode().into());
+
+    let result = provider.call(&tx).await
+        .map_err(|e| MevError::Provider(ProviderError::RpcError(e.to_string())))?;
+
+    let decoded = liquidityCall::abi_decode_returns(&result, true)
+        .map_err(|e: alloy::sol_types::Error| MevError::Provider(ProviderError::RpcError(e.to_string())))?;
+
+    Ok(U256::from(decoded._0))
+}
+
+/// Validate an arbitrage opportunity by checking liquidity and simulating slippage
+fn validate_arbitrage_opportunity(
+    buy_data: &DexPriceData,
+    sell_data: &DexPriceData,
+    spread_pct: f64,
+    _pair_name: &str,
+) -> OpportunityValidation {
+    // Step 1: Check minimum liquidity threshold
+    if buy_data.liquidity_usd < MIN_LIQUIDITY_USD || sell_data.liquidity_usd < MIN_LIQUIDITY_USD {
+        return OpportunityValidation::LowLiquidity {
+            buy_liquidity_usd: buy_data.liquidity_usd,
+            sell_liquidity_usd: sell_data.liquidity_usd,
+            min_required_usd: MIN_LIQUIDITY_USD,
+        };
+    }
+
+    // Step 2: Calculate trade size and simulate slippage
+    let trade_size_usd = TRADE_SIZE_ETH * ETH_PRICE_USD;
+
+    // Simulate slippage for the buy side (constant product formula: x * y = k)
+    // For a trade of size `dx`, output `dy = y * dx / (x + dx)`
+    // Slippage = (spot_price - effective_price) / spot_price
+    let buy_slippage_pct = calculate_slippage(trade_size_usd, buy_data.liquidity_usd);
+    let sell_slippage_pct = calculate_slippage(trade_size_usd, sell_data.liquidity_usd);
+    let total_slippage_pct = buy_slippage_pct + sell_slippage_pct;
+
+    // Step 3: Calculate actual profit after slippage
+    let actual_profit_pct = spread_pct - total_slippage_pct;
+
+    if actual_profit_pct <= 0.0 {
+        return OpportunityValidation::HighSlippage {
+            expected_profit_pct: spread_pct,
+            actual_profit_pct,
+            slippage_pct: total_slippage_pct,
+        };
+    }
+
+    // Step 4: Calculate profit in USD
+    let gross_profit_usd = trade_size_usd * (actual_profit_pct / 100.0);
+
+    // Step 5: Estimate gas cost
+    // For arbitrage: ~250k gas for a typical 2-hop swap
+    // Gas cost = gas_limit * (base_fee + priority_fee) * ETH_PRICE
+    let gas_cost_eth = (GAS_LIMIT_SWAP as f64) * (BASE_FEE_GWEI + PRIORITY_FEE_GWEI) / 1e9;
+    let gas_cost_usd = gas_cost_eth * ETH_PRICE_USD;
+
+    // Step 6: Check if profit exceeds gas cost
+    let net_profit_usd = gross_profit_usd - gas_cost_usd;
+
+    if net_profit_usd <= 0.0 {
+        return OpportunityValidation::GasExceedsProfit {
+            gross_profit_usd,
+            gas_cost_usd,
+        };
+    }
+
+    OpportunityValidation::Validated {
+        simulated_profit_usd: gross_profit_usd,
+        gas_cost_usd,
+        net_profit_usd,
+    }
+}
+
+/// Calculate slippage percentage for a given trade size and pool liquidity
+/// Uses constant product AMM formula approximation
+fn calculate_slippage(trade_size_usd: f64, liquidity_usd: f64) -> f64 {
+    if liquidity_usd <= 0.0 {
+        return 100.0; // 100% slippage for empty pools
+    }
+
+    // For constant product AMM: slippage ~= trade_size / (liquidity / 2)
+    // This is a simplified approximation of the x*y=k formula
+    // Actual slippage = dx / (x + dx) where x = liquidity/2
+    let reserve_per_side = liquidity_usd / 2.0;
+    let slippage = (trade_size_usd / (reserve_per_side + trade_size_usd)) * 100.0;
+
+    slippage
 }
 
 /// Run opportunity detector - processes pending txs and detects MEV opportunities
@@ -1838,24 +2464,487 @@ async fn run_detector(state: Arc<AppState>) -> Result<(), MevError> {
     }
 }
 
+// ============================================================================
+// Flash Loan Execution Logic
+// ============================================================================
+
+// FlashloanArbitrage contract interface
+sol! {
+    /// SwapStep struct matching the Solidity contract
+    #[derive(Debug)]
+    struct SolSwapStep {
+        uint8 protocol;      // 1=UniV2, 2=UniV3, 3=Balancer, 4=Curve
+        address router;
+        address tokenIn;
+        address tokenOut;
+        bytes swapData;
+        uint256 amountIn;    // 0 = use all available
+        uint256 minAmountOut;
+    }
+
+    /// FlashloanArbitrage contract interface
+    #[sol(rpc)]
+    contract FlashloanArbitrage {
+        function executeBalancerFlashloan(
+            address[] calldata tokens,
+            uint256[] calldata amounts,
+            bytes calldata swapData
+        ) external;
+
+        function owner() external view returns (address);
+    }
+}
+
+/// Flash loan arbitrage contract address
+const FLASHLOAN_CONTRACT_ADDRESS: &str = "0xF53bEFDe7B7631BA5749499FB33Fd145372976bA";
+
+/// Convert SwapStep to Solidity-compatible encoding
+fn encode_swap_steps(steps: &[SwapStep]) -> Bytes {
+    use alloy::sol_types::SolType;
+
+    let sol_steps: Vec<SolSwapStep> = steps.iter().map(|s| {
+        SolSwapStep {
+            protocol: s.protocol,
+            router: s.router,
+            tokenIn: s.token_in,
+            tokenOut: s.token_out,
+            swapData: Bytes::from(s.swap_data.clone()),
+            amountIn: s.amount_in,
+            minAmountOut: s.min_amount_out,
+        }
+    }).collect();
+
+    // ABI encode the array of SwapStep structs
+    let encoded = alloy::sol_types::sol_data::Array::<SolSwapStep>::abi_encode(&sol_steps);
+    Bytes::from(encoded)
+}
+
+/// Protocol ID constants matching the Solidity contract
+#[allow(dead_code)]
+mod protocol {
+    pub const UNISWAP_V2: u8 = 1;
+    pub const UNISWAP_V3: u8 = 2;
+    pub const BALANCER: u8 = 3;
+    pub const CURVE: u8 = 4;
+}
+
+/// Get protocol ID from DEX name
+#[allow(dead_code)]
+fn get_protocol_id(dex_name: &str) -> u8 {
+    match dex_name.to_lowercase().as_str() {
+        "univ2" | "uniswap" | "uniswapv2" | "sushi" | "sushiswap" | "shiba" | "shibaswap" | "frax" | "fraxswap" | "pancake" | "pancakeswap" => protocol::UNISWAP_V2,
+        "univ3" | "uniswapv3" => protocol::UNISWAP_V3,
+        "balancer" | "balancerv2" => protocol::BALANCER,
+        "curve" => protocol::CURVE,
+        _ => protocol::UNISWAP_V2, // Default to UniV2 style
+    }
+}
+
+/// Execute flash loan arbitrage opportunity
+async fn execute_flashloan_arbitrage(
+    state: &Arc<AppState>,
+    opportunity: &MevOpportunity,
+) -> Result<Option<FixedBytes<32>>, error::ExecutionError> {
+    // Check if we have the required data for execution
+    let flash_loan_token = opportunity.flash_loan_token
+        .ok_or_else(|| error::ExecutionError::SubmissionFailed("Missing flash loan token".to_string()))?;
+    let flash_loan_amount = opportunity.flash_loan_amount
+        .ok_or_else(|| error::ExecutionError::SubmissionFailed("Missing flash loan amount".to_string()))?;
+    let swap_steps = opportunity.swap_steps.as_ref()
+        .ok_or_else(|| error::ExecutionError::SubmissionFailed("Missing swap steps".to_string()))?;
+
+    if swap_steps.is_empty() {
+        return Err(error::ExecutionError::SubmissionFailed("No swap steps provided".to_string()));
+    }
+
+    // Get private key from environment
+    let private_key = Config::get_private_key()
+        .ok_or_else(|| error::ExecutionError::SignerError("PRIVATE_KEY environment variable not set".to_string()))?;
+
+    // Create signer from private key
+    let signer: PrivateKeySigner = private_key.parse()
+        .map_err(|e| error::ExecutionError::SignerError(format!("Failed to parse private key: {}", e)))?;
+    let wallet = EthereumWallet::from(signer.clone());
+    let signer_address = signer.address();
+
+    info!(
+        "Preparing flash loan execution for opportunity {}: token={:?}, amount={}, steps={}",
+        opportunity.id, flash_loan_token, flash_loan_amount, swap_steps.len()
+    );
+
+    // Parse contract address
+    let contract_address: Address = FLASHLOAN_CONTRACT_ADDRESS.parse()
+        .map_err(|e| error::ExecutionError::SubmissionFailed(format!("Invalid contract address: {}", e)))?;
+
+    // Encode swap steps
+    let swap_data = encode_swap_steps(swap_steps);
+    info!("Encoded swap data: {} bytes", swap_data.len());
+
+    // Build the contract call
+    let tokens = vec![flash_loan_token];
+    let amounts = vec![flash_loan_amount];
+
+    // Create the transaction request using sol! generated call
+    let call = FlashloanArbitrage::executeBalancerFlashloanCall {
+        tokens: tokens.clone(),
+        amounts: amounts.clone(),
+        swapData: swap_data.clone(),
+    };
+
+    let call_data = call.abi_encode();
+
+    // Get current gas price
+    let gas_price = state.http_provider.get_gas_price().await
+        .map_err(|e| error::ExecutionError::SubmissionFailed(format!("Failed to get gas price: {}", e)))?;
+
+    let max_gas_price_wei = state.config.monitoring.max_gas_price_gwei * 1_000_000_000;
+    if gas_price > max_gas_price_wei as u128 {
+        warn!(
+            "Gas price {} gwei exceeds max {} gwei, skipping execution",
+            gas_price / 1_000_000_000,
+            state.config.monitoring.max_gas_price_gwei
+        );
+        return Err(error::ExecutionError::GasPriceTooLow);
+    }
+
+    // Build transaction request for gas estimation
+    let tx_request = alloy::rpc::types::TransactionRequest::default()
+        .to(contract_address)
+        .from(signer_address)
+        .input(call_data.clone().into());
+
+    // Estimate gas
+    let estimated_gas = state.http_provider.estimate_gas(&tx_request).await
+        .map_err(|e| error::ExecutionError::SubmissionFailed(format!("Gas estimation failed: {}", e)))?;
+
+    let gas_limit = (estimated_gas as f64 * state.config.execution.gas_limit_multiplier) as u64;
+    let gas_cost_wei = gas_limit as u128 * gas_price;
+
+    info!(
+        "Gas estimate: {} units, limit: {} ({}x multiplier), cost: {} wei ({} gwei price)",
+        estimated_gas, gas_limit, state.config.execution.gas_limit_multiplier,
+        gas_cost_wei, gas_price / 1_000_000_000
+    );
+
+    // Parse and validate profit
+    let estimated_profit = opportunity.estimated_profit_wei.parse::<f64>().unwrap_or(0.0);
+    let net_profit_after_gas = estimated_profit - (gas_cost_wei as f64);
+
+    if net_profit_after_gas <= 0.0 {
+        warn!(
+            "Opportunity {} no longer profitable after gas: profit={}, gas_cost={}",
+            opportunity.id, estimated_profit, gas_cost_wei
+        );
+        return Err(error::ExecutionError::NotProfitable);
+    }
+
+    info!(
+        "Profit validation passed: estimated={}, gas_cost={}, net={}",
+        estimated_profit, gas_cost_wei, net_profit_after_gas
+    );
+
+    // Check if we should use Flashbots
+    if state.config.execution.use_flashbots {
+        info!("Submitting via Flashbots relay: {}", state.config.flashbots.relay_url);
+        return submit_flashbots_bundle(state, &call_data, contract_address, signer_address, gas_limit, &signer).await;
+    }
+
+    // Standard mempool submission
+    info!("Submitting transaction to mempool...");
+
+    // Get nonce
+    let nonce = state.http_provider.get_transaction_count(signer_address).await
+        .map_err(|e| error::ExecutionError::SubmissionFailed(format!("Failed to get nonce: {}", e)))?;
+
+    // Get current block for EIP-1559 fees
+    let block = state.http_provider.get_block_by_number(
+        alloy::eips::BlockNumberOrTag::Latest,
+        alloy::rpc::types::BlockTransactionsKind::Hashes
+    ).await
+        .map_err(|e| error::ExecutionError::SubmissionFailed(format!("Failed to get block: {}", e)))?
+        .ok_or_else(|| error::ExecutionError::SubmissionFailed("No block found".to_string()))?;
+
+    let base_fee = block.header.base_fee_per_gas
+        .ok_or_else(|| error::ExecutionError::SubmissionFailed("No base fee in block".to_string()))?;
+
+    let max_priority_fee: u128 = (state.config.execution.max_priority_fee_gwei * 1_000_000_000) as u128;
+    let max_fee_per_gas: u128 = (base_fee as u128) + max_priority_fee;
+
+    // Build EIP-1559 transaction
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(contract_address)
+        .from(signer_address)
+        .input(call_data.into())
+        .nonce(nonce)
+        .gas_limit(gas_limit)
+        .max_fee_per_gas(max_fee_per_gas)
+        .max_priority_fee_per_gas(max_priority_fee)
+        .with_chain_id(state.config.ethereum.chain_id);
+
+    // Create provider with wallet for signing
+    let provider_with_wallet = ProviderBuilder::new()
+        .wallet(wallet)
+        .on_http(state.config.ethereum.http_rpc_url.parse()
+            .map_err(|e| error::ExecutionError::SubmissionFailed(format!("Invalid RPC URL: {}", e)))?);
+
+    // Send transaction
+    let pending_tx = provider_with_wallet.send_transaction(tx).await
+        .map_err(|e| error::ExecutionError::SubmissionFailed(format!("Transaction submission failed: {}", e)))?;
+
+    let tx_hash = *pending_tx.tx_hash();
+    info!("Transaction submitted: {:?}", tx_hash);
+
+    // Wait for confirmation with timeout
+    let timeout_duration = Duration::from_secs(state.config.execution.deadline_secs);
+    match tokio::time::timeout(timeout_duration, pending_tx.get_receipt()).await {
+        Ok(Ok(receipt)) => {
+            if receipt.status() {
+                info!(
+                    "Transaction confirmed successfully! Hash: {:?}, Gas used: {}",
+                    tx_hash, receipt.gas_used
+                );
+                Ok(Some(tx_hash))
+            } else {
+                error!("Transaction reverted! Hash: {:?}", tx_hash);
+                Err(error::ExecutionError::TransactionReverted(format!("{:?}", tx_hash)))
+            }
+        }
+        Ok(Err(e)) => {
+            error!("Failed to get receipt: {}", e);
+            Err(error::ExecutionError::SubmissionFailed(format!("Receipt error: {}", e)))
+        }
+        Err(_) => {
+            warn!("Transaction confirmation timeout after {} seconds", state.config.execution.deadline_secs);
+            // Transaction was submitted but not confirmed in time - return the hash anyway
+            Ok(Some(tx_hash))
+        }
+    }
+}
+
+/// Submit transaction via Flashbots relay
+async fn submit_flashbots_bundle(
+    state: &Arc<AppState>,
+    call_data: &[u8],
+    contract_address: Address,
+    signer_address: Address,
+    gas_limit: u64,
+    signer: &PrivateKeySigner,
+) -> Result<Option<FixedBytes<32>>, error::ExecutionError> {
+    use alloy::signers::Signer;
+
+    // Get current block number for target block
+    let current_block = state.http_provider.get_block_number().await
+        .map_err(|e| error::ExecutionError::FlashbotsError(format!("Failed to get block number: {}", e)))?;
+    let target_block = current_block + 1;
+
+    // Get nonce
+    let nonce = state.http_provider.get_transaction_count(signer_address).await
+        .map_err(|e| error::ExecutionError::FlashbotsError(format!("Failed to get nonce: {}", e)))?;
+
+    // Get base fee from latest block
+    let block = state.http_provider.get_block_by_number(
+        alloy::eips::BlockNumberOrTag::Latest,
+        alloy::rpc::types::BlockTransactionsKind::Hashes
+    ).await
+        .map_err(|e| error::ExecutionError::FlashbotsError(format!("Failed to get block: {}", e)))?
+        .ok_or_else(|| error::ExecutionError::FlashbotsError("No block found".to_string()))?;
+
+    let base_fee = block.header.base_fee_per_gas
+        .ok_or_else(|| error::ExecutionError::FlashbotsError("No base fee in block".to_string()))?;
+
+    let max_priority_fee: u128 = (state.config.execution.max_priority_fee_gwei * 1_000_000_000) as u128;
+    let max_fee_per_gas: u128 = (base_fee as u128) + max_priority_fee + ((base_fee as u128) / 10); // Add 10% buffer
+
+    // Build the transaction
+    let tx = alloy::consensus::TxEip1559 {
+        chain_id: state.config.ethereum.chain_id,
+        nonce,
+        gas_limit,
+        max_fee_per_gas,
+        max_priority_fee_per_gas: max_priority_fee,
+        to: alloy::primitives::TxKind::Call(contract_address),
+        value: U256::ZERO,
+        access_list: Default::default(),
+        input: Bytes::from(call_data.to_vec()),
+    };
+
+    // Sign the transaction using sync API (since TxEip1559 needs mutable for async)
+    use alloy::consensus::SignableTransaction;
+
+    let mut tx_to_sign = tx.clone();
+    let signature = signer.sign_transaction_sync(&mut tx_to_sign)
+        .map_err(|e| error::ExecutionError::SignerError(format!("Failed to sign transaction: {}", e)))?;
+
+    let signed_tx = alloy::consensus::TxEnvelope::Eip1559(
+        tx.into_signed(signature)
+    );
+
+    // Encode the signed transaction
+    use alloy::eips::eip2718::Encodable2718;
+    let mut encoded_tx = Vec::new();
+    signed_tx.encode_2718(&mut encoded_tx);
+    let raw_tx_hex = format!("0x{}", hex::encode(&encoded_tx));
+
+    // Build Flashbots bundle request
+    let bundle_body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "eth_sendBundle",
+        "params": [{
+            "txs": [raw_tx_hex],
+            "blockNumber": format!("0x{:x}", target_block),
+            "minTimestamp": 0,
+            "maxTimestamp": chrono::Utc::now().timestamp() as u64 + state.config.execution.deadline_secs
+        }]
+    });
+
+    // Sign the bundle payload for Flashbots authentication
+    let body_str = serde_json::to_string(&bundle_body)
+        .map_err(|e| error::ExecutionError::FlashbotsError(format!("JSON serialization failed: {}", e)))?;
+
+    // Create message hash for Flashbots signature (keccak256 of the body)
+    let message_hash = alloy::primitives::keccak256(body_str.as_bytes());
+    let fb_signature = signer.sign_hash(&message_hash).await
+        .map_err(|e| error::ExecutionError::SignerError(format!("Failed to sign bundle: {}", e)))?;
+
+    let fb_auth_header = format!("{}:0x{}", signer_address, hex::encode(fb_signature.as_bytes()));
+
+    info!(
+        "Submitting Flashbots bundle for block {}: {} txs",
+        target_block, 1
+    );
+
+    // Submit to Flashbots relay
+    let client = reqwest::Client::new();
+    let response = client
+        .post(&state.config.flashbots.relay_url)
+        .header("Content-Type", "application/json")
+        .header("X-Flashbots-Signature", fb_auth_header)
+        .body(body_str)
+        .timeout(Duration::from_millis(state.config.flashbots.bundle_timeout_ms))
+        .send()
+        .await
+        .map_err(|e| error::ExecutionError::FlashbotsError(format!("Relay request failed: {}", e)))?;
+
+    let status = response.status();
+    let response_text = response.text().await
+        .map_err(|e| error::ExecutionError::FlashbotsError(format!("Failed to read response: {}", e)))?;
+
+    if status.is_success() {
+        info!("Flashbots bundle submitted successfully: {}", response_text);
+
+        // Parse response to get bundle hash
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&response_text) {
+            if let Some(result) = json.get("result") {
+                if let Some(bundle_hash) = result.get("bundleHash").and_then(|h| h.as_str()) {
+                    info!("Bundle hash: {}", bundle_hash);
+                }
+            }
+        }
+
+        // For Flashbots, we don't have a direct tx hash until inclusion
+        // Return None to indicate bundle was submitted but not yet confirmed
+        Ok(None)
+    } else {
+        error!("Flashbots bundle submission failed: {} - {}", status, response_text);
+        Err(error::ExecutionError::FlashbotsError(format!("Bundle rejected: {}", response_text)))
+    }
+}
+
 /// Run executor
 async fn run_executor(state: Arc<AppState>) -> Result<(), MevError> {
     let poll_interval = std::time::Duration::from_millis(50);
 
-    loop {
-        // Process detected opportunities
-        for entry in state.opportunities.iter() {
-            let opportunity = entry.value();
+    info!("Executor started, contract address: {}", FLASHLOAN_CONTRACT_ADDRESS);
 
-            if opportunity.status == "pending" {
-                if state.config.execution.dry_run {
+    // Verify we have a private key configured
+    if Config::get_private_key().is_none() {
+        warn!("PRIVATE_KEY not set - executor will only work in dry_run mode");
+    }
+
+    loop {
+        // Collect opportunities to process (avoid holding lock during execution)
+        let opportunities_to_process: Vec<(String, MevOpportunity)> = state.opportunities
+            .iter()
+            .filter(|entry| entry.value().status == "pending" || entry.value().status == "high_priority")
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
+        for (opp_id, opportunity) in opportunities_to_process {
+            // Update status to executing
+            if let Some(mut entry) = state.opportunities.get_mut(&opp_id) {
+                entry.status = "executing".to_string();
+            }
+
+            if state.config.execution.dry_run {
+                // Dry run mode - simulate but don't execute
+                info!(
+                    "DRY RUN: Would execute opportunity {} | Type: {} | Profit: {} | Target: {}",
+                    opportunity.id,
+                    opportunity.opportunity_type,
+                    opportunity.net_profit_wei,
+                    opportunity.target_tx
+                );
+
+                if let (Some(token), Some(amount), Some(steps)) = (
+                    &opportunity.flash_loan_token,
+                    &opportunity.flash_loan_amount,
+                    &opportunity.swap_steps,
+                ) {
                     info!(
-                        "Dry run: Would execute opportunity {} with profit {}",
-                        opportunity.id, opportunity.net_profit_wei
+                        "  Flash loan: token={:?}, amount={}, steps={}",
+                        token, amount, steps.len()
                     );
-                } else {
-                    // Real execution would happen here
-                    info!("Executing opportunity: {}", opportunity.id);
+                    for (i, step) in steps.iter().enumerate() {
+                        info!(
+                            "  Step {}: protocol={}, router={:?}, {}->{}",
+                            i + 1, step.protocol, step.router, step.token_in, step.token_out
+                        );
+                    }
+                }
+
+                // Update status to simulated
+                if let Some(mut entry) = state.opportunities.get_mut(&opp_id) {
+                    entry.status = "simulated".to_string();
+                }
+            } else {
+                // Real execution mode
+                info!(
+                    "EXECUTING opportunity {} | Type: {} | Profit: {}",
+                    opportunity.id,
+                    opportunity.opportunity_type,
+                    opportunity.net_profit_wei
+                );
+
+                match execute_flashloan_arbitrage(&state, &opportunity).await {
+                    Ok(Some(tx_hash)) => {
+                        info!(
+                            "SUCCESS: Opportunity {} executed, tx: {:?}",
+                            opportunity.id, tx_hash
+                        );
+                        if let Some(mut entry) = state.opportunities.get_mut(&opp_id) {
+                            entry.status = "executed".to_string();
+                        }
+                    }
+                    Ok(None) => {
+                        // Flashbots bundle submitted but not yet confirmed
+                        info!(
+                            "PENDING: Opportunity {} submitted via Flashbots, awaiting inclusion",
+                            opportunity.id
+                        );
+                        if let Some(mut entry) = state.opportunities.get_mut(&opp_id) {
+                            entry.status = "pending_inclusion".to_string();
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "FAILED: Opportunity {} execution error: {}",
+                            opportunity.id, e
+                        );
+                        if let Some(mut entry) = state.opportunities.get_mut(&opp_id) {
+                            entry.status = format!("failed: {}", e);
+                        }
+                    }
                 }
             }
         }
