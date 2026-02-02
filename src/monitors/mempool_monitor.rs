@@ -9,7 +9,7 @@ use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy::pubsub::PubSubFrontend;
 use alloy::rpc::types::Transaction as RpcTransaction;
 use async_trait::async_trait;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -150,8 +150,8 @@ pub struct MempoolMonitor {
     stats: RwLock<MempoolStats>,
     /// Reconnection configuration
     reconnect_config: ReconnectConfig,
-    /// Seen transaction hashes (to avoid duplicates)
-    seen_txs: RwLock<HashSet<TxHash>>,
+    /// Seen transaction hashes with LRU ordering (HashSet for O(1) lookup, VecDeque for eviction order)
+    seen_txs: RwLock<(HashSet<TxHash>, VecDeque<TxHash>)>,
     /// Maximum seen transactions to keep
     max_seen_txs: usize,
 }
@@ -168,7 +168,7 @@ impl MempoolMonitor {
             stop_tx: RwLock::new(None),
             stats: RwLock::new(MempoolStats::default()),
             reconnect_config: ReconnectConfig::default(),
-            seen_txs: RwLock::new(HashSet::new()),
+            seen_txs: RwLock::new((HashSet::new(), VecDeque::new())),
             max_seen_txs: 100_000,
         }
     }
@@ -184,7 +184,7 @@ impl MempoolMonitor {
             stop_tx: RwLock::new(None),
             stats: RwLock::new(MempoolStats::default()),
             reconnect_config: ReconnectConfig::default(),
-            seen_txs: RwLock::new(HashSet::new()),
+            seen_txs: RwLock::new((HashSet::new(), VecDeque::new())),
             max_seen_txs: 100_000,
         }
     }
@@ -411,19 +411,34 @@ impl MempoolMonitor {
 
         let path_bytes = &data[path_offset + 32..path_offset + 32 + path_len];
 
-        // Each hop is 20 bytes (address) + 3 bytes (fee)
-        // So path = addr(20) || fee(3) || addr(20) || fee(3) || ... || addr(20)
+        // V3 path format: token0 (20) + fee (3) + token1 (20) + fee (3) + ... + tokenN (20)
+        // Total length for N tokens = 20 + (N-1) * 23
+        // Minimum valid path is 2 tokens: 20 + 3 + 20 = 43 bytes
+        if path_bytes.len() < 43 {
+            return None;
+        }
+
         let mut path = Vec::new();
         let mut offset = 0;
-        while offset + 20 <= path_bytes.len() {
+
+        // First token (20 bytes)
+        path.push(Address::from_slice(&path_bytes[offset..offset + 20]));
+        offset += 20;
+
+        // Remaining tokens: each preceded by 3-byte fee
+        while offset + 23 <= path_bytes.len() {
+            offset += 3; // Skip fee
             path.push(Address::from_slice(&path_bytes[offset..offset + 20]));
-            offset += 23; // 20 (address) + 3 (fee)
-            if offset > path_bytes.len() && offset - 3 + 20 <= path_bytes.len() {
-                // Last token
-                path.push(Address::from_slice(
-                    &path_bytes[offset - 3..offset - 3 + 20],
-                ));
-                break;
+            offset += 20;
+        }
+
+        // Check for final token if there's exactly enough bytes left
+        // This handles the case where path ends with just a token (no trailing fee)
+        if offset + 3 == path_bytes.len() - 20 + 3 && path_bytes.len() > offset {
+            // There might be a fee + final token remaining
+            if offset + 3 + 20 == path_bytes.len() {
+                offset += 3;
+                path.push(Address::from_slice(&path_bytes[offset..offset + 20]));
             }
         }
 
@@ -480,16 +495,30 @@ impl MempoolMonitor {
         }
     }
 
-    /// Check if we've seen this transaction before
+    /// Check if we've seen this transaction before using LRU-style eviction
     async fn mark_seen(&self, hash: TxHash) -> bool {
-        let mut seen = self.seen_txs.write().await;
+        let mut guard = self.seen_txs.write().await;
+        let (set, queue) = &mut *guard;
 
-        // Clear if too large
-        if seen.len() >= self.max_seen_txs {
-            seen.clear();
+        // Check if already seen
+        if set.contains(&hash) {
+            return true;
         }
 
-        !seen.insert(hash)
+        // Evict oldest entries if at capacity (LRU-style)
+        while set.len() >= self.max_seen_txs {
+            if let Some(old_hash) = queue.pop_front() {
+                set.remove(&old_hash);
+            } else {
+                break;
+            }
+        }
+
+        // Insert new hash
+        set.insert(hash);
+        queue.push_back(hash);
+
+        false
     }
 
     /// Main monitoring loop
@@ -499,9 +528,7 @@ impl MempoolMonitor {
         mut stop_rx: mpsc::Receiver<()>,
     ) {
         // Create HTTP provider for fetching full transactions
-        let http_provider = match ProviderBuilder::new().on_http(self.http_url.parse().unwrap()) {
-            provider => provider,
-        };
+        let http_provider = ProviderBuilder::new().on_http(self.http_url.parse().unwrap());
 
         while self.running.load(Ordering::Relaxed) {
             // Connect with exponential backoff
@@ -601,7 +628,7 @@ impl MempoolMonitor {
                                     );
 
                                     // Send event
-                                    if let Err(e) = event_tx.send(MonitorEvent::PendingTransaction(transaction)).await {
+                                    if let Err(e) = event_tx.send(MonitorEvent::PendingTransaction(Box::new(transaction))).await {
                                         error!("{}: Failed to send transaction event: {:?}", self.name, e);
                                         return;
                                     }
@@ -623,32 +650,21 @@ impl MempoolMonitor {
     }
 }
 
+/// NOTE: The Monitor trait implementation for MempoolMonitor uses unsafe raw pointers
+/// which can cause use-after-free bugs. Use ArcMempoolMonitor for safe usage.
+/// This implementation is kept for backward compatibility but should not be used directly.
 #[async_trait]
 impl Monitor for MempoolMonitor {
     fn name(&self) -> &str {
         &self.name
     }
 
-    async fn start(&self, tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
-        if self.running.swap(true, Ordering::Relaxed) {
-            return Err(MevError::Provider(ProviderError::SubscriptionError(
-                "Mempool monitor is already running".to_string(),
-            )));
-        }
-
-        let (stop_tx, stop_rx) = mpsc::channel(1);
-        {
-            let mut guard = self.stop_tx.write().await;
-            *guard = Some(stop_tx);
-        }
-
-        let self_ref = unsafe { &*(self as *const MempoolMonitor) };
-
-        tokio::spawn(async move {
-            self_ref.run_monitoring_loop(tx, stop_rx).await;
-        });
-
-        Ok(())
+    async fn start(&self, _tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
+        // This implementation is deprecated due to safety concerns.
+        // Use ArcMempoolMonitor::start() instead which uses safe Arc-based patterns.
+        Err(MevError::Provider(ProviderError::SubscriptionError(
+            "Direct MempoolMonitor::start() is unsafe. Use ArcMempoolMonitor instead.".to_string(),
+        )))
     }
 
     async fn stop(&self) -> Result<()> {

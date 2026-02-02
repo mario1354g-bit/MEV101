@@ -174,7 +174,7 @@ impl SandwichExecutor {
             .get("router")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<Address>().ok())
-            .unwrap_or_else(|| target_tx.to);
+            .unwrap_or(target_tx.to);
 
         let protocol = metadata
             .get("protocol")
@@ -546,16 +546,18 @@ impl FlashbotsSandwichBundle {
     ///
     /// Note: Flashbots bundles can include both signed txs and tx hashes.
     /// The relay will include the referenced tx if it's in the mempool.
+    /// Bundle execution order: frontrun_tx -> victim_tx (by hash) -> backrun_tx
     pub fn to_flashbots_bundle(&self) -> FlashbotsBundle {
         // For sandwich attacks, we submit frontrun and backrun as signed txs
         // The victim tx is referenced by hash and must be in the mempool
-        FlashbotsBundle {
-            txs: vec![self.frontrun_tx.clone(), self.backrun_tx.clone()],
-            block_number: self.block_number,
-            min_timestamp: None,
-            max_timestamp: None,
-            revert_on_fail: self.revert_on_fail,
-        }
+        // Use the sandwich constructor to properly include the victim tx hash
+        FlashbotsBundle::sandwich(
+            self.frontrun_tx.clone(),
+            self.victim_tx_hash,
+            self.backrun_tx.clone(),
+            self.block_number,
+        )
+        .with_revert_on_fail(self.revert_on_fail)
     }
 }
 

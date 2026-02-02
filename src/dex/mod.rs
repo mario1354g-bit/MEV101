@@ -109,7 +109,44 @@ pub struct SwapParams {
 
 impl SwapParams {
     /// Create new swap parameters for a direct swap
+    /// Returns an error if token_in equals token_out (invalid swap)
     pub fn new(
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        amount_out_min: U256,
+        recipient: Address,
+        deadline: U256,
+    ) -> DexResult<Self> {
+        // Validate that input and output tokens are different
+        if token_in == token_out {
+            return Err(DexError::InvalidParameters(
+                "token_in and token_out must be different".to_string(),
+            ));
+        }
+
+        // Validate that amount_in is non-zero
+        if amount_in.is_zero() {
+            return Err(DexError::InvalidParameters(
+                "amount_in must be greater than zero".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            token_in,
+            token_out,
+            amount_in,
+            amount_out_min,
+            recipient,
+            deadline,
+            path: vec![token_in, token_out],
+            fee: None,
+        })
+    }
+
+    /// Create new swap parameters without validation (unsafe)
+    /// Use when you've already validated the parameters
+    pub fn new_unchecked(
         token_in: Address,
         token_out: Address,
         amount_in: U256,
@@ -265,7 +302,7 @@ mod tests {
             amount_out_min,
             recipient,
             deadline,
-        );
+        ).unwrap();
 
         assert_eq!(params.token_in, token_in);
         assert_eq!(params.token_out, token_out);
@@ -278,6 +315,35 @@ mod tests {
     }
 
     #[test]
+    fn test_swap_params_same_token_fails() {
+        let token = Address::repeat_byte(1);
+        let result = SwapParams::new(
+            token,
+            token, // Same token - should fail
+            U256::from(1000u64),
+            U256::from(900u64),
+            Address::repeat_byte(2),
+            U256::from(1700000000u64),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_swap_params_zero_amount_fails() {
+        let result = SwapParams::new(
+            Address::ZERO,
+            Address::repeat_byte(1),
+            U256::ZERO, // Zero amount - should fail
+            U256::from(900u64),
+            Address::repeat_byte(2),
+            U256::from(1700000000u64),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn test_swap_params_with_fee() {
         let params = SwapParams::new(
             Address::ZERO,
@@ -287,6 +353,7 @@ mod tests {
             Address::repeat_byte(2),
             U256::from(1700000000u64),
         )
+        .unwrap()
         .with_fee(3000);
 
         assert_eq!(params.fee, Some(3000));

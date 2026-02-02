@@ -20,6 +20,32 @@ pub enum MevError {
 
     #[error("Decoding error: {0}")]
     Decoding(#[from] DecodingError),
+
+    #[error("MEV strategy error: {0}")]
+    Strategy(#[from] MevStrategyError),
+}
+
+/// MEV-specific strategy errors
+#[derive(Error, Debug)]
+#[allow(dead_code)] // Strategy error variants reserved for future use
+pub enum MevStrategyError {
+    #[error("Opportunity expired: detected at block {detected_block}, current block {current_block}")]
+    OpportunityExpired { detected_block: u64, current_block: u64 },
+
+    #[error("Insufficient profit margin: expected {expected}, actual {actual}")]
+    InsufficientProfit { expected: String, actual: String },
+
+    #[error("Frontrun detected: competitor tx {0}")]
+    FrontrunDetected(String),
+
+    #[error("Bundle inclusion failed: {0}")]
+    BundleNotIncluded(String),
+
+    #[error("State conflict: slot {slot} changed between simulation and execution")]
+    StateConflict { slot: String },
+
+    #[error("Gas price spike: current {current_gwei} gwei exceeds max {max_gwei} gwei")]
+    GasPriceSpike { current_gwei: u64, max_gwei: u64 },
 }
 
 /// Configuration-related errors
@@ -43,6 +69,7 @@ pub enum ConfigError {
 
 /// Database-related errors
 #[derive(Error, Debug)]
+#[allow(dead_code)] // Error variants reserved for complete database error handling
 pub enum DatabaseError {
     #[error("SQLx error: {0}")]
     Sqlx(#[from] sqlx::Error),
@@ -65,6 +92,7 @@ pub enum DatabaseError {
 
 /// Ethereum provider-related errors
 #[derive(Error, Debug)]
+#[allow(dead_code)] // Error variants reserved for complete provider error handling
 pub enum ProviderError {
     #[error("Failed to connect to RPC endpoint: {0}")]
     ConnectionFailed(String),
@@ -93,6 +121,7 @@ pub enum ProviderError {
 
 /// Simulation-related errors
 #[derive(Error, Debug)]
+#[allow(dead_code)] // Error variants reserved for complete simulation error handling
 pub enum SimulationError {
     #[error("Simulation reverted: {0}")]
     Reverted(String),
@@ -118,6 +147,7 @@ pub enum SimulationError {
 
 /// Execution-related errors
 #[derive(Error, Debug)]
+#[allow(dead_code)] // Error variants reserved for complete execution error handling
 pub enum ExecutionError {
     #[error("Transaction submission failed: {0}")]
     SubmissionFailed(String),
@@ -158,6 +188,7 @@ pub enum ExecutionError {
 
 /// Decoding-related errors
 #[derive(Error, Debug)]
+#[allow(dead_code)] // Error variants reserved for complete decoding error handling
 pub enum DecodingError {
     #[error("Failed to decode ABI: {0}")]
     AbiDecode(String),
@@ -185,22 +216,32 @@ pub enum DecodingError {
 }
 
 /// Result type alias for MevError
+#[allow(dead_code)] // Type aliases available for future use
 pub type Result<T> = std::result::Result<T, MevError>;
 
 /// Result type alias for ConfigError
 pub type ConfigResult<T> = std::result::Result<T, ConfigError>;
 
 /// Result type alias for DatabaseError
+#[allow(dead_code)] // Type alias available for future use
 pub type DatabaseResult<T> = std::result::Result<T, DatabaseError>;
 
 /// Result type alias for ProviderError
+#[allow(dead_code)] // Type alias available for future use
 pub type ProviderResult<T> = std::result::Result<T, ProviderError>;
 
 /// Result type alias for SimulationError
+#[allow(dead_code)] // Type alias available for future use (conflicts with simulation::SimulationResult struct)
 pub type SimulationResult<T> = std::result::Result<T, SimulationError>;
 
 /// Result type alias for ExecutionError
+#[allow(dead_code)] // Type alias available for future use
 pub type ExecutionResult<T> = std::result::Result<T, ExecutionError>;
 
 /// Result type alias for DecodingError
+#[allow(dead_code)] // Type alias available for future use
 pub type DecodingResult<T> = std::result::Result<T, DecodingError>;
+
+/// Result type alias for MevStrategyError
+#[allow(dead_code)] // Type alias available for future use
+pub type MevStrategyResult<T> = std::result::Result<T, MevStrategyError>;

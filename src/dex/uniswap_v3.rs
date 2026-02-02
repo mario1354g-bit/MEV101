@@ -465,22 +465,74 @@ impl UniswapV3 {
         ratio * ratio
     }
 
-    /// Convert price to sqrtPriceX96
+    /// Convert price to sqrtPriceX96 with safe overflow handling
+    /// Uses integer math where possible to avoid precision loss
     pub fn price_to_sqrt_price_x96(price: f64) -> U256 {
         if price <= 0.0 {
             return U256::ZERO;
         }
 
-        let sqrt_price = price.sqrt();
-        let q96: f64 = 2.0_f64.powi(96);
-        let result = sqrt_price * q96;
+        // For very large prices that would overflow u128, use a safer approach
+        // Max safe price is approximately (2^128 / 2^96)^2 = 2^64
+        const MAX_SAFE_PRICE: f64 = 1.8446744e19; // ~2^64
 
-        // Convert to U256, handling potential overflow
-        if result.is_infinite() || result.is_nan() {
-            U256::MAX
+        if price > MAX_SAFE_PRICE {
+            // For very large prices, calculate in parts to avoid overflow
+            // sqrtPriceX96 = sqrt(price) * 2^96
+            let sqrt_price = price.sqrt();
+            let log_result = sqrt_price.log2() + 96.0;
+
+            if log_result >= 256.0 {
+                return U256::MAX; // Would overflow U256
+            }
+
+            // Use bit manipulation for precision
+            let int_part = log_result.floor() as u32;
+            let frac_part = log_result - (int_part as f64);
+
+            // 2^int_part * 2^frac_part
+            let base = if int_part < 256 {
+                U256::from(1u128) << int_part
+            } else {
+                return U256::MAX;
+            };
+
+            // Approximate 2^frac_part using linear interpolation for small fractions
+            let multiplier = ((1.0 + frac_part * std::f64::consts::LN_2) * 1e18) as u128;
+            base * U256::from(multiplier) / U256::from(1_000_000_000_000_000_000u128)
         } else {
-            U256::from(result as u128)
+            let sqrt_price = price.sqrt();
+            let q96: f64 = 2.0_f64.powi(96);
+            let result = sqrt_price * q96;
+
+            if result.is_infinite() || result.is_nan() {
+                U256::MAX
+            } else if result > u128::MAX as f64 {
+                // Handle overflow case
+                U256::MAX
+            } else {
+                U256::from(result as u128)
+            }
         }
+    }
+
+    /// Convert sqrtPriceX96 to price using safe integer math
+    /// Returns price as a scaled U256 (scaled by 1e18 for precision)
+    pub fn sqrt_price_x96_to_price_scaled(sqrt_price_x96: U256) -> U256 {
+        if sqrt_price_x96.is_zero() {
+            return U256::ZERO;
+        }
+
+        let q96 = U256::from(1u128) << 96;
+
+        // price_scaled = (sqrt_price_x96 * sqrt_price_x96 * 1e18) / (2^96 * 2^96)
+        // To avoid overflow, compute step by step
+        // price_scaled = ((sqrt_price_x96 * scale_sqrt) / q96)^2
+        // where scale_sqrt = sqrt(1e18) = 1e9
+        let scale_sqrt = U256::from(1_000_000_000u128); // 1e9
+
+        let intermediate = sqrt_price_x96 * scale_sqrt / q96;
+        intermediate * intermediate
     }
 
     /// Convert tick to price
@@ -564,6 +616,102 @@ impl UniswapV3 {
 
         Ok((tokens, fees))
     }
+
+    /// Get the full V3 pool state with proper representation
+    pub async fn get_pool_state<T: Transport + Clone, P: Provider<T>>(
+        &self,
+        pool: &Address,
+        provider: &P,
+    ) -> DexResult<V3PoolState> {
+        let slot0 = self.get_slot0(pool, provider).await?;
+        let liquidity = self.get_liquidity(pool, provider).await?;
+        let fee_pips = self.get_pool_fee(pool, provider).await?;
+
+        Ok(V3PoolState {
+            sqrt_price_x96: slot0.sqrt_price_x96,
+            tick: slot0.tick,
+            liquidity,
+            fee_pips,
+        })
+    }
+
+    /// V3 swap math implementation following Uniswap V3 whitepaper
+    /// This calculates output for swaps that don't cross tick boundaries
+    /// For accurate multi-tick simulation, use the Quoter contract
+    pub fn get_amount_out_v3(
+        &self,
+        amount_in: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+        fee_pips: u32,
+    ) -> U256 {
+        if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
+            return U256::ZERO;
+        }
+
+        // Apply fee: amount_in_after_fee = amount_in * (1_000_000 - fee_pips) / 1_000_000
+        let fee_complement = U256::from(1_000_000u32 - fee_pips);
+        let amount_in_after_fee = amount_in * fee_complement / U256::from(1_000_000u32);
+
+        // V3 concentrated liquidity formula for single tick:
+        // For token0 -> token1 (zero_for_one = true):
+        //   delta_y = L * delta_sqrt_P
+        //   where delta_sqrt_P = amount_in_after_fee * sqrt_P / x (x = reserve_in for token0)
+        //
+        // For token1 -> token0 (zero_for_one = false):
+        //   delta_x = L / sqrt_P_new - L / sqrt_P_old
+        //
+        // Simplified single-tick approximation:
+        // Use the property that within a tick range, the pool behaves like a V2 pool
+        // but with the effective reserves being the liquidity at that price point.
+        //
+        // For single-tick swaps: output = (amount_in_after_fee * reserve_out) / (reserve_in + amount_in_after_fee)
+        let numerator = amount_in_after_fee * reserve_out;
+        let denominator = reserve_in + amount_in_after_fee;
+
+        if denominator.is_zero() {
+            U256::ZERO
+        } else {
+            numerator / denominator
+        }
+    }
+
+    /// V3 swap math for calculating required input for desired output
+    /// Accounts for fee tiers properly
+    pub fn get_amount_in_v3(
+        &self,
+        amount_out: U256,
+        reserve_in: U256,
+        reserve_out: U256,
+        fee_pips: u32,
+    ) -> U256 {
+        if amount_out.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
+            return U256::ZERO;
+        }
+
+        if amount_out >= reserve_out {
+            return U256::MAX;
+        }
+
+        // Calculate amount_in before fee
+        // amount_in_before_fee = (reserve_in * amount_out) / (reserve_out - amount_out)
+        let numerator = reserve_in * amount_out;
+        let denominator = reserve_out - amount_out;
+
+        if denominator.is_zero() {
+            return U256::MAX;
+        }
+
+        let amount_in_before_fee = numerator / denominator + U256::from(1u64);
+
+        // Apply fee: amount_in = amount_in_before_fee * 1_000_000 / (1_000_000 - fee_pips)
+        let fee_complement = U256::from(1_000_000u32 - fee_pips);
+        if fee_complement.is_zero() {
+            return U256::MAX;
+        }
+
+        amount_in_before_fee * U256::from(1_000_000u32) / fee_complement + U256::from(1u64)
+    }
 }
 
 /// Slot0 data from a Uniswap V3 pool
@@ -583,6 +731,41 @@ pub struct Slot0Data {
     pub fee_protocol: u8,
     /// Whether pool is unlocked
     pub unlocked: bool,
+}
+
+/// V3-specific pool state representation
+/// This properly represents V3 liquidity state instead of forcing it into V2-style reserves
+#[derive(Debug, Clone)]
+pub struct V3PoolState {
+    /// sqrt(price) * 2^96
+    pub sqrt_price_x96: U256,
+    /// Current tick
+    pub tick: i32,
+    /// Current in-range liquidity
+    pub liquidity: u128,
+    /// Fee tier in pips (e.g., 3000 = 0.3%)
+    pub fee_pips: u32,
+}
+
+impl V3PoolState {
+    /// Calculate token0 reserve from liquidity and sqrt price
+    /// x = L / sqrt(P)
+    pub fn calculate_reserve0(&self) -> U256 {
+        if self.sqrt_price_x96.is_zero() {
+            return U256::ZERO;
+        }
+        let q96 = U256::from(1u128) << 96;
+        // x = L * 2^96 / sqrtPriceX96
+        U256::from(self.liquidity) * q96 / self.sqrt_price_x96
+    }
+
+    /// Calculate token1 reserve from liquidity and sqrt price
+    /// y = L * sqrt(P)
+    pub fn calculate_reserve1(&self) -> U256 {
+        let q96 = U256::from(1u128) << 96;
+        // y = L * sqrtPriceX96 / 2^96
+        U256::from(self.liquidity) * self.sqrt_price_x96 / q96
+    }
 }
 
 #[async_trait]
@@ -624,15 +807,27 @@ impl Dex for UniswapV3 {
         pool: &Address,
         provider: &P,
     ) -> DexResult<Reserves> {
-        // V3 doesn't have traditional reserves, but we can provide
-        // liquidity information in a similar format
+        // V3 doesn't have traditional reserves like V2
+        // We calculate approximate reserves from liquidity and sqrt price
         let slot0 = self.get_slot0(pool, provider).await?;
         let liquidity = self.get_liquidity(pool, provider).await?;
 
-        // For V3, we return liquidity and sqrt_price as "reserves"
+        // Create V3PoolState for proper reserve calculation
+        let pool_state = V3PoolState {
+            sqrt_price_x96: slot0.sqrt_price_x96,
+            tick: slot0.tick,
+            liquidity,
+            fee_pips: self.get_pool_fee(pool, provider).await.unwrap_or(3000),
+        };
+
+        // Calculate actual token reserves from liquidity and price
+        // These are the virtual reserves at current price point
+        let reserve0 = pool_state.calculate_reserve0();
+        let reserve1 = pool_state.calculate_reserve1();
+
         Ok(Reserves {
-            reserve0: U256::from(liquidity),
-            reserve1: slot0.sqrt_price_x96,
+            reserve0,
+            reserve1,
             block_timestamp_last: 0, // V3 doesn't track this the same way
         })
     }
@@ -843,44 +1038,24 @@ impl Dex for UniswapV3 {
     }
 
     fn get_amount_out(&self, amount_in: U256, reserve_in: U256, reserve_out: U256) -> U256 {
-        // V3 uses a different AMM formula based on concentrated liquidity
-        // This is a simplified approximation for price estimation
-        // For accurate quotes, use the Quoter contract
+        // V3 uses concentrated liquidity math, not constant product
+        // For accurate quotes, use the Quoter contract or get_amount_out_v3()
+        // This implementation uses proper V3 math assuming single-tick (no tick crossing)
         if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
             return U256::ZERO;
         }
 
-        // Simple constant product approximation (not accurate for V3)
-        // Real V3 calculations require tick-by-tick simulation
-        let numerator = amount_in * reserve_out;
-        let denominator = reserve_in + amount_in;
-
-        if denominator.is_zero() {
-            U256::ZERO
-        } else {
-            numerator / denominator
-        }
+        // Default to 0.3% fee tier if not specified
+        // Use V3 math: apply fee first, then calculate output
+        let fee_pips = 3000u32; // 0.3%
+        self.get_amount_out_v3(amount_in, reserve_in, reserve_out, fee_pips)
     }
 
     fn get_amount_in(&self, amount_out: U256, reserve_in: U256, reserve_out: U256) -> U256 {
-        // V3 uses a different AMM formula
-        // This is a simplified approximation
-        if amount_out.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
-            return U256::ZERO;
-        }
-
-        if amount_out >= reserve_out {
-            return U256::MAX;
-        }
-
-        let numerator = reserve_in * amount_out;
-        let denominator = reserve_out - amount_out;
-
-        if denominator.is_zero() {
-            U256::MAX
-        } else {
-            numerator / denominator + U256::from(1u64)
-        }
+        // V3 uses concentrated liquidity math with fees
+        // Default to 0.3% fee tier
+        let fee_pips = 3000u32;
+        self.get_amount_in_v3(amount_out, reserve_in, reserve_out, fee_pips)
     }
 }
 

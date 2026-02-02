@@ -16,6 +16,20 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{debug, info, warn};
 
+/// Extension trait for Vec to add elements only if not present
+trait DedupPush<T> {
+    /// Push an element only if it's not already in the vector
+    fn dedup_push(&mut self, item: T);
+}
+
+impl<T: PartialEq> DedupPush<T> for Vec<T> {
+    fn dedup_push(&mut self, item: T) {
+        if !self.contains(&item) {
+            self.push(item);
+        }
+    }
+}
+
 // Factory interfaces for pool discovery
 sol! {
     #[sol(rpc)]
@@ -198,34 +212,65 @@ impl PoolRegistry {
     }
 
     /// Add a pool to the registry
+    /// Uses atomic operations to prevent race conditions
+    /// and avoid duplicate entries in index vectors
     pub fn add_pool(&self, pool: PoolInfo) {
         let address = pool.address;
         let token0 = pool.token0;
         let token1 = pool.token1;
 
-        // Add to main pool map
-        if self.pools.insert(address, pool).is_none() {
-            self.pool_count.fetch_add(1, Ordering::Relaxed);
-        }
+        // First check if pool already exists to avoid duplicate index entries
+        let already_exists = self.pools.contains_key(&address);
 
-        // Add to pair index (both directions)
-        self.pairs
-            .entry((token0, token1))
-            .or_default()
-            .push(address);
+        // Insert or update the pool data
+        self.pools.insert(address, pool);
 
-        if token0 != token1 {
+        // Only update indexes and count if this is a new pool
+        if !already_exists {
+            // Atomically increment pool count - use SeqCst for proper ordering
+            self.pool_count.fetch_add(1, Ordering::SeqCst);
+
+            // Add to pair index (both directions), avoiding duplicates
             self.pairs
-                .entry((token1, token0))
+                .entry((token0, token1))
                 .or_default()
-                .push(address);
+                .dedup_push(address);
+
+            if token0 != token1 {
+                self.pairs
+                    .entry((token1, token0))
+                    .or_default()
+                    .dedup_push(address);
+            }
+
+            // Add to single token index, avoiding duplicates
+            self.token_pools
+                .entry(token0)
+                .or_default()
+                .dedup_push(address);
+
+            if token0 != token1 {
+                self.token_pools
+                    .entry(token1)
+                    .or_default()
+                    .dedup_push(address);
+            }
+        }
+    }
+
+    /// Add a pool only if it doesn't already exist
+    /// Returns true if the pool was added, false if it already existed
+    pub fn try_add_pool(&self, pool: PoolInfo) -> bool {
+        let address = pool.address;
+
+        // Check if pool already exists
+        if self.pools.contains_key(&address) {
+            return false;
         }
 
-        // Add to single token index
-        self.token_pools.entry(token0).or_default().push(address);
-        if token0 != token1 {
-            self.token_pools.entry(token1).or_default().push(address);
-        }
+        // Add the pool
+        self.add_pool(pool);
+        true
     }
 
     /// Get a pool by address

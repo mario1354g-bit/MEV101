@@ -207,8 +207,28 @@ impl BlockMonitor {
                                 // Update last block
                                 let prev_block = self.last_block.swap(block_info.number, Ordering::Relaxed);
 
-                                // Warn if we missed blocks
-                                if prev_block > 0 && block_info.number > prev_block + 1 {
+                                // Check for chain reorganization (new block number <= previous)
+                                if prev_block > 0 && block_info.number <= prev_block {
+                                    let depth = prev_block - block_info.number + 1;
+                                    warn!(
+                                        "{}: Potential chain reorg detected. Previous head: {}, New head: {}, Depth: {}",
+                                        self.name,
+                                        prev_block,
+                                        block_info.number,
+                                        depth
+                                    );
+
+                                    // Emit reorg event
+                                    if let Err(e) = event_tx.send(MonitorEvent::ChainReorg {
+                                        old_head: prev_block,
+                                        new_head: block_info.number,
+                                        depth,
+                                    }).await {
+                                        error!("{}: Failed to send reorg event: {:?}", self.name, e);
+                                    }
+                                }
+                                // Warn if we missed blocks (gap detection)
+                                else if prev_block > 0 && block_info.number > prev_block + 1 {
                                     warn!(
                                         "{}: Missed {} blocks ({} -> {})",
                                         self.name,
@@ -256,37 +276,20 @@ impl BlockMonitor {
     }
 }
 
+/// NOTE: The Monitor trait implementation for BlockMonitor uses unsafe raw pointers
+/// which can cause use-after-free bugs. Use ArcBlockMonitor for safe usage.
 #[async_trait]
 impl Monitor for BlockMonitor {
     fn name(&self) -> &str {
         &self.name
     }
 
-    async fn start(&self, tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
-        if self.running.swap(true, Ordering::Relaxed) {
-            return Err(MevError::Provider(ProviderError::SubscriptionError(
-                "Block monitor is already running".to_string(),
-            )));
-        }
-
-        let (stop_tx, stop_rx) = mpsc::channel(1);
-        {
-            let mut guard = self.stop_tx.write().await;
-            *guard = Some(stop_tx);
-        }
-
-        // Spawn the monitoring loop
-        let self_ref = unsafe {
-            // Safety: We ensure the monitor lives as long as the spawned task
-            // by requiring Arc<BlockMonitor> in practice
-            &*(self as *const BlockMonitor)
-        };
-
-        tokio::spawn(async move {
-            self_ref.run_monitoring_loop(tx, stop_rx).await;
-        });
-
-        Ok(())
+    async fn start(&self, _tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
+        // This implementation is deprecated due to safety concerns.
+        // Use ArcBlockMonitor::start() instead which uses safe Arc-based patterns.
+        Err(MevError::Provider(ProviderError::SubscriptionError(
+            "Direct BlockMonitor::start() is unsafe. Use ArcBlockMonitor instead.".to_string(),
+        )))
     }
 
     async fn stop(&self) -> Result<()> {

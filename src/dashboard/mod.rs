@@ -52,6 +52,8 @@ impl Dashboard {
             .route("/", get(index_handler))
             .route("/opportunity/{id}", get(opportunity_detail_page_handler))
             // API routes
+            .route("/api/health", get(health_handler))
+            .route("/api/metrics", get(metrics_handler))
             .route("/api/stats", get(stats_handler))
             .route("/api/opportunities", get(opportunities_handler))
             .route("/api/opportunities/{id}", get(opportunity_detail_handler))

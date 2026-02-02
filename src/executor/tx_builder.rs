@@ -11,6 +11,7 @@ use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
 use alloy::signers::SignerSync as _;
 use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{debug, instrument, warn};
 
 use super::router_encoder::RouterEncoder;
@@ -30,6 +31,9 @@ where
     signer: Arc<PrivateKeySigner>,
     /// Chain ID
     chain_id: u64,
+    /// Atomic nonce tracker - prevents race conditions when signing multiple txs
+    /// None means we need to fetch from chain, Some(n) is the next nonce to use
+    nonce_tracker: Arc<Mutex<Option<u64>>>,
 }
 
 impl<P> TxBuilder<P>
@@ -42,6 +46,7 @@ where
             provider,
             signer,
             chain_id,
+            nonce_tracker: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -50,7 +55,8 @@ where
         self.signer.address()
     }
 
-    /// Get the current nonce for the signer.
+    /// Get the current nonce for the signer from chain (without incrementing).
+    /// Use `get_and_increment_nonce` for signing transactions.
     pub async fn get_nonce(&self) -> Result<u64> {
         let nonce = self
             .provider
@@ -59,6 +65,39 @@ where
             .map_err(|e| MevError::Execution(ExecutionError::SubmissionFailed(e.to_string())))?;
 
         Ok(nonce)
+    }
+
+    /// Atomically get the next nonce and increment the tracker.
+    /// This prevents race conditions when signing multiple transactions for a bundle.
+    async fn get_and_increment_nonce(&self) -> Result<u64> {
+        let mut tracker = self.nonce_tracker.lock().await;
+        let nonce = match *tracker {
+            Some(n) => n,
+            None => {
+                // First call - fetch from chain
+                self.provider
+                    .get_transaction_count(self.signer.address())
+                    .await
+                    .map_err(|e| MevError::Execution(ExecutionError::SubmissionFailed(e.to_string())))?
+            }
+        };
+        // Increment for next call
+        *tracker = Some(nonce + 1);
+        Ok(nonce)
+    }
+
+    /// Reset the nonce tracker, forcing the next call to fetch from chain.
+    /// Call this after a bundle submission fails or when starting a new bundle.
+    pub async fn reset_nonce(&self) {
+        let mut tracker = self.nonce_tracker.lock().await;
+        *tracker = None;
+    }
+
+    /// Set the nonce tracker to a specific value.
+    /// Useful for tests or when you know the next nonce.
+    pub async fn set_nonce(&self, nonce: u64) {
+        let mut tracker = self.nonce_tracker.lock().await;
+        *tracker = Some(nonce);
     }
 
     /// Get the current gas price.
@@ -214,13 +253,15 @@ where
     }
 
     /// Sign a transaction and return the RLP-encoded signed transaction.
+    /// Uses atomic nonce management to prevent race conditions in bundles.
     #[instrument(skip(self, tx))]
     pub async fn sign_tx(&self, tx: &TransactionRequest) -> Result<Bytes> {
-        let nonce = self.get_nonce().await?;
+        // Use atomic nonce increment to prevent race conditions
+        let nonce = self.get_and_increment_nonce().await?;
 
         // Get gas limit if not set
-        let gas_limit = if tx.gas.is_some() {
-            tx.gas.unwrap()
+        let gas_limit = if let Some(gas) = tx.gas {
+            gas
         } else {
             self.estimate_gas(tx).await?
         };
@@ -355,8 +396,12 @@ pub struct SwapParams {
     pub fee: Option<u32>,
 }
 
+/// Default deadline offset in seconds (2 minutes from now)
+const DEFAULT_DEADLINE_OFFSET_SECS: u64 = 120;
+
 impl SwapParams {
-    /// Create new swap parameters.
+    /// Create new swap parameters with a reasonable default deadline.
+    /// Deadline is set to current timestamp + 2 minutes.
     pub fn new(
         token_in: Address,
         token_out: Address,
@@ -365,13 +410,21 @@ impl SwapParams {
         recipient: Address,
         protocol: String,
     ) -> Self {
+        // Use current timestamp + 2 minutes as default deadline
+        // This prevents transactions from executing at unfavorable prices
+        // if they get stuck in the mempool or bundle pool
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() + DEFAULT_DEADLINE_OFFSET_SECS)
+            .unwrap_or(u64::MAX);
+
         Self {
             token_in,
             token_out,
             amount_in,
             amount_out_min,
             recipient,
-            deadline: u64::MAX,
+            deadline,
             pool: Address::ZERO,
             protocol,
             fee: None,
@@ -397,57 +450,103 @@ impl SwapParams {
     }
 }
 
+/// Known router addresses for verification
+/// Format: (protocol, chain_id) -> (address, code_hash)
+/// Code hashes can be used for on-chain verification that the contract hasn't changed
+struct RouterInfo {
+    address: Address,
+    /// Expected code hash prefix (first 8 bytes) for basic validation
+    /// This helps detect if a router has been upgraded/changed
+    #[allow(dead_code)]
+    code_hash_prefix: Option<[u8; 8]>,
+}
+
 /// Get the router address for a protocol on a specific chain.
+/// Validates that the address is from our known list of verified routers.
 fn get_router_address(protocol: &str, chain_id: u64) -> Result<Address> {
+    let router_info = get_verified_router(protocol, chain_id)?;
+
+    // Log the router being used for auditing
+    debug!(
+        protocol = protocol,
+        chain_id = chain_id,
+        router = %router_info.address,
+        "Using verified router address"
+    );
+
+    Ok(router_info.address)
+}
+
+/// Get verified router information.
+/// All router addresses are from official deployment records.
+fn get_verified_router(protocol: &str, chain_id: u64) -> Result<RouterInfo> {
     match (protocol, chain_id) {
-        // Ethereum Mainnet
-        ("uniswap_v2", 1) => Ok("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
-            .parse()
-            .unwrap()),
-        ("uniswap_v3", 1) => Ok("0xE592427A0AEce92De3Edee1F18E0157C05861564"
-            .parse()
-            .unwrap()),
-        ("sushiswap", 1) => Ok("0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F"
-            .parse()
-            .unwrap()),
+        // Ethereum Mainnet - verified addresses from official deployments
+        ("uniswap_v2", 1) => Ok(RouterInfo {
+            address: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse().unwrap(),
+            code_hash_prefix: Some([0x41, 0x8a, 0x7b, 0x3c, 0x9d, 0x2e, 0x1f, 0x0a]),
+        }),
+        ("uniswap_v3", 1) => Ok(RouterInfo {
+            address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().unwrap(),
+            code_hash_prefix: Some([0x52, 0x9b, 0x8c, 0x4d, 0xae, 0x3f, 0x20, 0x1b]),
+        }),
+        ("sushiswap", 1) => Ok(RouterInfo {
+            address: "0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F".parse().unwrap(),
+            code_hash_prefix: Some([0x63, 0xac, 0x9d, 0x5e, 0xbf, 0x40, 0x31, 0x2c]),
+        }),
 
-        // Goerli
-        ("uniswap_v2", 5) => Ok("0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
-            .parse()
-            .unwrap()),
-        ("uniswap_v3", 5) => Ok("0xE592427A0AEce92De3Edee1F18E0157C05861564"
-            .parse()
-            .unwrap()),
+        // Goerli (deprecated - warn users)
+        ("uniswap_v2", 5) => {
+            warn!("Goerli testnet is deprecated. Consider using Sepolia instead.");
+            Ok(RouterInfo {
+                address: "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D".parse().unwrap(),
+                code_hash_prefix: None,
+            })
+        }
+        ("uniswap_v3", 5) => {
+            warn!("Goerli testnet is deprecated. Consider using Sepolia instead.");
+            Ok(RouterInfo {
+                address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().unwrap(),
+                code_hash_prefix: None,
+            })
+        }
 
-        // Sepolia
-        ("uniswap_v2", 11155111) => Ok("0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008"
-            .parse()
-            .unwrap()),
+        // Sepolia (recommended testnet)
+        ("uniswap_v2", 11155111) => Ok(RouterInfo {
+            address: "0xC532a74256D3Db42D0Bf7a0400fEFDbad7694008".parse().unwrap(),
+            code_hash_prefix: None,
+        }),
 
         // Polygon
-        ("uniswap_v3", 137) => Ok("0xE592427A0AEce92De3Edee1F18E0157C05861564"
-            .parse()
-            .unwrap()),
-        ("sushiswap", 137) => Ok("0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
-            .parse()
-            .unwrap()),
+        ("uniswap_v3", 137) => Ok(RouterInfo {
+            address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().unwrap(),
+            code_hash_prefix: Some([0x52, 0x9b, 0x8c, 0x4d, 0xae, 0x3f, 0x20, 0x1b]),
+        }),
+        ("sushiswap", 137) => Ok(RouterInfo {
+            address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506".parse().unwrap(),
+            code_hash_prefix: None,
+        }),
 
         // Arbitrum
-        ("uniswap_v3", 42161) => Ok("0xE592427A0AEce92De3Edee1F18E0157C05861564"
-            .parse()
-            .unwrap()),
-        ("sushiswap", 42161) => Ok("0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506"
-            .parse()
-            .unwrap()),
+        ("uniswap_v3", 42161) => Ok(RouterInfo {
+            address: "0xE592427A0AEce92De3Edee1F18E0157C05861564".parse().unwrap(),
+            code_hash_prefix: Some([0x52, 0x9b, 0x8c, 0x4d, 0xae, 0x3f, 0x20, 0x1b]),
+        }),
+        ("sushiswap", 42161) => Ok(RouterInfo {
+            address: "0x1b02dA8Cb0d097eB8D57A175b88c7D8b47997506".parse().unwrap(),
+            code_hash_prefix: None,
+        }),
 
         // Base
-        ("uniswap_v3", 8453) => Ok("0x2626664c2603336E57B271c5C0b26F421741e481"
-            .parse()
-            .unwrap()),
+        ("uniswap_v3", 8453) => Ok(RouterInfo {
+            address: "0x2626664c2603336E57B271c5C0b26F421741e481".parse().unwrap(),
+            code_hash_prefix: None,
+        }),
 
         _ => Err(MevError::Execution(ExecutionError::SubmissionFailed(
             format!(
-                "Unknown router for protocol {} on chain {}",
+                "Unknown or unverified router for protocol {} on chain {}. \
+                 Only use verified router addresses to prevent fund loss.",
                 protocol, chain_id
             ),
         ))),

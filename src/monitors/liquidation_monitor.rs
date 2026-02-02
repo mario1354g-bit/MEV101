@@ -231,6 +231,7 @@ pub struct LiquidationMonitor {
     /// Statistics
     stats: RwLock<LiquidationStats>,
     /// Reconnection configuration
+    #[allow(dead_code)] // Reserved for WebSocket reconnection logic
     reconnect_config: ReconnectConfig,
 }
 
@@ -505,10 +506,36 @@ impl LiquidationMonitor {
         checked
     }
 
-    /// Estimate liquidation profit
+    /// Estimate liquidation profit with gas cost consideration
+    /// gas_price_gwei: current gas price in gwei
+    /// eth_price_usd: current ETH price in USD
+    #[allow(dead_code)] // Reserved for profit estimation in opportunity detection
+    fn estimate_profit_with_gas(&self, protocol: LendingProtocol, debt_usd: f64, gas_price_gwei: f64, eth_price_usd: f64) -> f64 {
+        // Liquidation bonus varies by protocol and asset
+        let bonus_pct = match protocol {
+            LendingProtocol::AaveV3 => 0.05,     // ~5% average
+            LendingProtocol::CompoundV3 => 0.08, // ~8%
+            LendingProtocol::Euler => 0.10,      // ~10%
+            LendingProtocol::Morpho => 0.05,     // ~5%
+        };
+
+        // Estimate gas cost
+        let gas_units = 400_000u64; // Liquidation + flash loan typical gas
+        let gas_cost_eth = (gas_units as f64) * gas_price_gwei * 1e-9;
+        let gas_cost_usd = gas_cost_eth * eth_price_usd;
+
+        // Max liquidation is typically 50% of debt
+        let max_liquidation = debt_usd * 0.5;
+        let gross_profit = max_liquidation * bonus_pct;
+
+        // Return net profit (clamped to 0 if negative)
+        (gross_profit - gas_cost_usd).max(0.0)
+    }
+
+    /// Estimate liquidation profit (without gas consideration, for backward compat)
     fn estimate_profit(&self, protocol: LendingProtocol, debt_usd: f64) -> f64 {
         // Liquidation bonus varies by protocol and asset
-        // This is a simplified estimation
+        // This is a simplified estimation without gas costs
         let bonus_pct = match protocol {
             LendingProtocol::AaveV3 => 0.05,     // ~5% average
             LendingProtocol::CompoundV3 => 0.08, // ~8%
@@ -767,32 +794,20 @@ impl LiquidationMonitor {
     }
 }
 
+/// NOTE: The Monitor trait implementation for LiquidationMonitor uses unsafe raw pointers
+/// which can cause use-after-free bugs. Use ArcLiquidationMonitor for safe usage.
 #[async_trait]
 impl Monitor for LiquidationMonitor {
     fn name(&self) -> &str {
         &self.name
     }
 
-    async fn start(&self, tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
-        if self.running.swap(true, Ordering::Relaxed) {
-            return Err(MevError::Provider(ProviderError::SubscriptionError(
-                "Liquidation monitor is already running".to_string(),
-            )));
-        }
-
-        let (stop_tx, stop_rx) = mpsc::channel(1);
-        {
-            let mut guard = self.stop_tx.write().await;
-            *guard = Some(stop_tx);
-        }
-
-        let self_ref = unsafe { &*(self as *const LiquidationMonitor) };
-
-        tokio::spawn(async move {
-            self_ref.run_monitoring_loop(tx, stop_rx).await;
-        });
-
-        Ok(())
+    async fn start(&self, _tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
+        // This implementation is deprecated due to safety concerns.
+        // Use ArcLiquidationMonitor::start() instead which uses safe Arc-based patterns.
+        Err(MevError::Provider(ProviderError::SubscriptionError(
+            "Direct LiquidationMonitor::start() is unsafe. Use ArcLiquidationMonitor instead.".to_string(),
+        )))
     }
 
     async fn stop(&self) -> Result<()> {

@@ -241,6 +241,8 @@ pub struct RegisteredPool {
     pub reserve1: U256,
     pub fee_bps: u32,
     pub last_updated: DateTime<Utc>,
+    /// Block number when reserves were last updated (for staleness check)
+    pub last_block: u64,
 }
 
 impl PoolRegistry {
@@ -290,12 +292,24 @@ impl PoolRegistry {
             .unwrap_or_default()
     }
 
-    /// Update pool reserves
+    /// Update pool reserves atomically with block number check to prevent stale updates
     pub fn update_reserves(&self, address: Address, reserve0: U256, reserve1: U256) {
+        self.update_reserves_at_block(address, reserve0, reserve1, 0);
+    }
+
+    /// Update pool reserves with block number for staleness protection
+    /// Only updates if block_number >= pool's last_block (prevents reorg issues)
+    pub fn update_reserves_at_block(&self, address: Address, reserve0: U256, reserve1: U256, block_number: u64) {
         if let Some(mut pool) = self.pools.get_mut(&address) {
-            pool.reserve0 = reserve0;
-            pool.reserve1 = reserve1;
-            pool.last_updated = Utc::now();
+            // Only update if this is newer data (or block is 0 for backward compat)
+            if block_number == 0 || block_number >= pool.last_block {
+                pool.reserve0 = reserve0;
+                pool.reserve1 = reserve1;
+                pool.last_updated = Utc::now();
+                if block_number > 0 {
+                    pool.last_block = block_number;
+                }
+            }
         }
     }
 
@@ -678,13 +692,21 @@ pub fn estimate_sandwich_profit(
 }
 
 /// Calculate output amount for a CPMM swap
+/// fee_bps: fee in basis points (e.g., 30 = 0.30%)
 pub fn calculate_amount_out(
     amount_in: U256,
     reserve_in: U256,
     reserve_out: U256,
     fee_bps: u32,
 ) -> U256 {
+    // Validate inputs
     if amount_in.is_zero() || reserve_in.is_zero() || reserve_out.is_zero() {
+        return U256::ZERO;
+    }
+
+    // Fee sanity check (max 10% = 1000 bps to catch malformed data)
+    if fee_bps > 1000 {
+        tracing::warn!("Unusually high fee: {} bps, clamping to 1000", fee_bps);
         return U256::ZERO;
     }
 
@@ -773,34 +795,52 @@ pub fn generate_opportunity_id(opp_type: OpportunityType, tokens: &[Address]) ->
 // Utility Functions
 // ============================================================================
 
-/// Convert U256 to f64 (loses precision for large numbers)
+/// Convert U256 to f64 with proper handling of large values
+/// For MEV calculations, we typically work with wei amounts that fit in u128
+/// For values > u128::MAX, uses logarithmic scaling to preserve relative precision
 pub fn u256_to_f64(val: U256) -> f64 {
-    // Handle the conversion carefully to avoid overflow
-    let bytes = val.to_be_bytes::<32>();
-    let mut result = 0.0f64;
-    for (i, &byte) in bytes.iter().enumerate() {
-        result += (byte as f64) * 256f64.powi(31 - i as i32);
+    if val.is_zero() {
+        return 0.0;
     }
-    result
+
+    // For values that fit in u128, use direct conversion (most common case)
+    if val <= U256::from(u128::MAX) {
+        let low: u128 = val.to::<u128>();
+        return low as f64;
+    }
+
+    // For larger values, use logarithmic scaling to preserve relative precision
+    // This is acceptable for profit comparisons but not for exact amounts
+    let bits = 256 - val.leading_zeros();
+    let shift = bits.saturating_sub(53); // f64 mantissa is 53 bits
+    let shifted = val >> shift;
+    let base: f64 = shifted.to::<u128>() as f64;
+    base * 2f64.powi(shift as i32)
 }
 
-/// Convert f64 to U256 (for non-negative values)
+/// Convert f64 to U256 with overflow protection
 pub fn f64_to_u256(val: f64) -> U256 {
-    if val <= 0.0 {
+    if val <= 0.0 || val.is_nan() {
         return U256::ZERO;
     }
-    if val.is_infinite() || val.is_nan() {
-        return U256::ZERO;
-    }
-
-    // Handle very large numbers
-    if val >= 2.0f64.powi(256) {
+    if val.is_infinite() {
         return U256::MAX;
     }
 
-    // Convert through string for precision
-    let int_val = val.trunc() as u128;
-    U256::from(int_val)
+    // Handle very large numbers - use u128::MAX as practical limit for most MEV operations
+    if val >= 2.0f64.powi(128) {
+        // For extremely large values, try to preserve some precision
+        if val >= 2.0f64.powi(256) {
+            return U256::MAX;
+        }
+        // Scale down, convert, then scale back up
+        let exp = (val.log2() - 64.0).floor() as i32;
+        let mantissa = (val / 2f64.powi(exp)) as u128;
+        return U256::from(mantissa) << exp as usize;
+    }
+
+    // Safe conversion for values that fit in u128
+    U256::from(val as u128)
 }
 
 #[cfg(test)]

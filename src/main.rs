@@ -2,6 +2,7 @@ mod config;
 mod error;
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
@@ -16,8 +17,10 @@ use axum::{
 use dashmap::DashMap;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::SqlitePool;
+use tokio::runtime::Builder;
 use tokio::signal;
 use tokio::sync::broadcast;
+use tokio::time::timeout;
 use tower_http::cors::{Any, CorsLayer};
 use tracing::{error, info, warn, Level};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -82,8 +85,26 @@ pub struct MevOpportunity {
     pub status: String,
 }
 
-#[tokio::main]
-async fn main() -> Result<(), MevError> {
+fn main() -> Result<(), MevError> {
+    // Build optimized multi-threaded runtime for low-latency MEV operations
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(num_cpus::get().max(4))
+        .max_blocking_threads(128)
+        .enable_all()
+        .thread_keep_alive(Duration::from_secs(60))
+        .thread_name_fn(|| {
+            static ATOMIC_ID: std::sync::atomic::AtomicUsize =
+                std::sync::atomic::AtomicUsize::new(0);
+            let id = ATOMIC_ID.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            format!("mev-worker-{}", id)
+        })
+        .build()
+        .expect("Failed to create Tokio runtime");
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), MevError> {
     // Load environment variables from .env file
     let _ = dotenv::dotenv();
 
@@ -272,9 +293,16 @@ async fn main() -> Result<(), MevError> {
     // Broadcast shutdown to all tasks
     let _ = shutdown_tx.send(());
 
-    // Wait for all tasks to complete
+    // Wait for all tasks to complete with timeout for graceful shutdown
     for handle in handles {
-        let _ = handle.await;
+        match timeout(Duration::from_secs(10), handle).await {
+            Ok(result) => {
+                let _ = result;
+            }
+            Err(_) => {
+                warn!("Task did not complete within shutdown timeout");
+            }
+        }
     }
 
     info!("MEV Monitor stopped gracefully");
@@ -461,7 +489,7 @@ async fn create_ws_provider(
 async fn run_mempool_monitor(state: Arc<AppState>) -> Result<(), MevError> {
 
     let poll_interval = std::time::Duration::from_millis(state.config.monitoring.poll_interval_ms * 10);
-    let mut pending_tx_count: u64 = 0;
+    let pending_tx_count: u64 = 0;
     let mut last_log = std::time::Instant::now();
 
     info!("Mempool monitor: attempting to subscribe to pending transactions");
@@ -517,7 +545,7 @@ async fn run_block_monitor(state: Arc<AppState>) -> Result<(), MevError> {
     loop {
         match state.http_provider.get_block_number().await {
             Ok(block_number) => {
-                if last_block.map_or(true, |last| block_number > last) {
+                if last_block.is_none_or(|last| block_number > last) {
                     info!("New block: {}", block_number);
                     last_block = Some(block_number);
 
@@ -987,7 +1015,7 @@ async fn run_detector(state: Arc<AppState>) -> Result<(), MevError> {
     let poll_interval = std::time::Duration::from_millis(500);
     let mut last_status_log = std::time::Instant::now();
     let mut txs_analyzed: u64 = 0;
-    let mut opportunities_found: u64 = 0;
+    let opportunities_found: u64 = 0;
 
     // DEX router addresses to watch
     let dex_routers: Vec<Address> = state.config.monitoring.dex_routers

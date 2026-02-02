@@ -231,6 +231,25 @@ pub struct HourlyEntry {
     pub intensity: f64, // 0.0 to 1.0 for heatmap
 }
 
+/// Health check response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HealthResponse {
+    pub status: String,
+    pub version: String,
+    pub uptime_seconds: u64,
+    pub database_connected: bool,
+}
+
+/// Metrics response for monitoring.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MetricsResponse {
+    pub opportunities_total: i64,
+    pub opportunities_24h: i64,
+    pub executions_total: i64,
+    pub executions_successful: i64,
+    pub active_pools: i64,
+}
+
 /// API error response.
 #[derive(Debug, Serialize)]
 pub struct ApiError {
@@ -404,12 +423,87 @@ pub async fn stats_handler(
     }))
 }
 
+/// Health check endpoint.
+pub async fn health_handler(
+    State(state): State<AppState>,
+) -> Result<Json<HealthResponse>, ApiError> {
+    // Check database connectivity
+    let db_connected = sqlx::query("SELECT 1")
+        .fetch_one(state.db.pool())
+        .await
+        .is_ok();
+
+    Ok(Json(HealthResponse {
+        status: if db_connected { "healthy".to_string() } else { "degraded".to_string() },
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        uptime_seconds: 0, // Could be tracked with a start time in AppState
+        database_connected: db_connected,
+    }))
+}
+
+/// Metrics endpoint for monitoring systems.
+pub async fn metrics_handler(
+    State(state): State<AppState>,
+) -> Result<Json<MetricsResponse>, ApiError> {
+    let now = chrono::Utc::now().timestamp_millis();
+    let day_ago = now - 86_400_000;
+
+    // Get total opportunities
+    let total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM opportunities")
+        .fetch_one(state.db.pool())
+        .await
+        .map_err(|e| ApiError {
+            error: e.to_string(),
+            code: 500,
+        })?;
+
+    // Get 24h opportunities
+    let count_24h: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM opportunities WHERE timestamp >= ?")
+            .bind(day_ago)
+            .fetch_one(state.db.pool())
+            .await
+            .map_err(|e| ApiError {
+                error: e.to_string(),
+                code: 500,
+            })?;
+
+    // Get total executions
+    let executions_total: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM executions")
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap_or((0,));
+
+    // Get successful executions
+    let executions_successful: (i64,) =
+        sqlx::query_as("SELECT COUNT(*) FROM executions WHERE status = 'confirmed'")
+            .fetch_one(state.db.pool())
+            .await
+            .unwrap_or((0,));
+
+    // Get active pools
+    let active_pools: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM pools WHERE is_active = 1")
+        .fetch_one(state.db.pool())
+        .await
+        .unwrap_or((0,));
+
+    Ok(Json(MetricsResponse {
+        opportunities_total: total.0,
+        opportunities_24h: count_24h.0,
+        executions_total: executions_total.0,
+        executions_successful: executions_successful.0,
+        active_pools: active_pools.0,
+    }))
+}
+
 /// Get list of opportunities with filtering.
 pub async fn opportunities_handler(
     State(state): State<AppState>,
     Query(params): Query<OpportunityQuery>,
 ) -> Result<Json<Vec<OpportunityResponse>>, ApiError> {
-    let mut query = String::from(
+    use sqlx::QueryBuilder;
+
+    let mut builder: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
         "SELECT id, timestamp, opportunity_type, token_pairs, protocol_venues,
          estimated_gross_profit_wei, estimated_gas_cost_wei, estimated_net_profit_wei,
          block_number_detected, block_number_disappeared, blocks_persisted,
@@ -418,59 +512,55 @@ pub async fn opportunities_handler(
          FROM opportunities WHERE 1=1",
     );
 
-    let mut bindings: Vec<String> = Vec::new();
-
     if let Some(ref opp_type) = params.opportunity_type {
-        query.push_str(" AND opportunity_type = ?");
-        bindings.push(opp_type.clone());
+        builder.push(" AND opportunity_type = ");
+        builder.push_bind(opp_type.clone());
     }
 
     if let Some(ref pair) = params.token_pair {
-        query.push_str(" AND token_pairs LIKE ?");
-        bindings.push(format!("%{}%", pair));
+        builder.push(" AND token_pairs LIKE ");
+        builder.push_bind(format!("%{}%", pair));
     }
 
     if let Some(from_ts) = params.from_timestamp {
-        query.push_str(&format!(" AND timestamp >= {}", from_ts));
+        builder.push(" AND timestamp >= ");
+        builder.push_bind(from_ts);
     }
 
     if let Some(to_ts) = params.to_timestamp {
-        query.push_str(&format!(" AND timestamp <= {}", to_ts));
+        builder.push(" AND timestamp <= ");
+        builder.push_bind(to_ts);
     }
 
     if let Some(sim) = params.simulated {
-        query.push_str(&format!(" AND simulated = {}", if sim { 1 } else { 0 }));
+        builder.push(" AND simulated = ");
+        builder.push_bind(if sim { 1 } else { 0 });
     }
 
     if let Some(exec) = params.executed {
-        query.push_str(&format!(" AND executed = {}", if exec { 1 } else { 0 }));
+        builder.push(" AND executed = ");
+        builder.push_bind(if exec { 1 } else { 0 });
     }
 
     if let Some(min_profit) = params.min_profit_eth {
         let min_wei = eth_to_wei(min_profit);
-        query.push_str(&format!(
-            " AND CAST(estimated_net_profit_wei AS INTEGER) >= {}",
-            min_wei
-        ));
+        builder.push(" AND CAST(estimated_net_profit_wei AS INTEGER) >= ");
+        builder.push_bind(min_wei as i64);
     }
 
-    query.push_str(&format!(
-        " ORDER BY timestamp DESC LIMIT {} OFFSET {}",
-        params.limit, params.offset
-    ));
+    builder.push(" ORDER BY timestamp DESC LIMIT ");
+    builder.push_bind(params.limit);
+    builder.push(" OFFSET ");
+    builder.push_bind(params.offset);
 
-    // Build dynamic query
-    let mut sql_query = sqlx::query_as::<_, OpportunityRow>(&query);
-    for binding in &bindings {
-        sql_query = sql_query.bind(binding);
-    }
-
-    let rows: Vec<OpportunityRow> = sql_query.fetch_all(state.db.pool()).await.map_err(|e| {
-        ApiError {
+    let rows: Vec<OpportunityRow> = builder
+        .build_query_as::<OpportunityRow>()
+        .fetch_all(state.db.pool())
+        .await
+        .map_err(|e| ApiError {
             error: e.to_string(),
             code: 500,
-        }
-    })?;
+        })?;
 
     let opportunities: Vec<OpportunityResponse> = rows.into_iter().map(row_to_response).collect();
 
@@ -771,7 +861,9 @@ pub async fn executions_handler(
     State(state): State<AppState>,
     Query(params): Query<ExecutionQuery>,
 ) -> Result<Json<Vec<ExecutionResponse>>, ApiError> {
-    let mut query = String::from(
+    use sqlx::QueryBuilder;
+
+    let mut builder: QueryBuilder<sqlx::Sqlite> = QueryBuilder::new(
         "SELECT id, opportunity_id, tx_hash, block_number, tx_index, status,
          gas_price_wei, gas_limit, gas_used, gas_cost_wei, gross_profit_wei,
          net_profit_wei, slippage_bps, error_message, submitted_at, confirmed_at
@@ -779,27 +871,32 @@ pub async fn executions_handler(
     );
 
     if let Some(opp_id) = params.opportunity_id {
-        query.push_str(&format!(" AND opportunity_id = {}", opp_id));
+        builder.push(" AND opportunity_id = ");
+        builder.push_bind(opp_id);
     }
 
     if let Some(ref status) = params.status {
-        query.push_str(&format!(" AND status = '{}'", status));
+        builder.push(" AND status = ");
+        builder.push_bind(status.clone());
     }
 
     if let Some(from_ts) = params.from_timestamp {
-        query.push_str(&format!(" AND submitted_at >= {}", from_ts));
+        builder.push(" AND submitted_at >= ");
+        builder.push_bind(from_ts);
     }
 
     if let Some(to_ts) = params.to_timestamp {
-        query.push_str(&format!(" AND submitted_at <= {}", to_ts));
+        builder.push(" AND submitted_at <= ");
+        builder.push_bind(to_ts);
     }
 
-    query.push_str(&format!(
-        " ORDER BY submitted_at DESC LIMIT {} OFFSET {}",
-        params.limit, params.offset
-    ));
+    builder.push(" ORDER BY submitted_at DESC LIMIT ");
+    builder.push_bind(params.limit);
+    builder.push(" OFFSET ");
+    builder.push_bind(params.offset);
 
-    let rows: Vec<ExecutionRow> = sqlx::query_as(&query)
+    let rows: Vec<ExecutionRow> = builder
+        .build_query_as::<ExecutionRow>()
         .fetch_all(state.db.pool())
         .await
         .map_err(|e| ApiError {

@@ -4,7 +4,7 @@ use std::path::Path;
 use crate::error::{ConfigError, ConfigResult};
 
 /// Main configuration struct for the MEV monitor
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub ethereum: EthereumConfig,
@@ -16,13 +16,63 @@ pub struct Config {
     pub monitoring: MonitoringConfig,
 
     #[serde(default)]
+    pub simulation: SimulationConfig,
+
+    #[serde(default)]
     pub execution: ExecutionConfig,
+
+    #[serde(default)]
+    pub flashbots: FlashbotsConfig,
 
     #[serde(default)]
     pub dashboard: DashboardConfig,
 
     #[serde(default)]
     pub logging: LoggingConfig,
+}
+
+/// Simulation configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SimulationConfig {
+    /// Enable transaction simulation
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Fork block number (None = latest)
+    #[serde(default)]
+    pub fork_block: Option<u64>,
+
+    /// Simulation timeout in milliseconds
+    #[serde(default = "default_simulation_timeout")]
+    pub timeout_ms: u64,
+
+    /// Enable parallel simulation
+    #[serde(default = "default_true")]
+    pub parallel: bool,
+
+    /// Number of simulation workers
+    #[serde(default = "default_simulation_workers")]
+    pub workers: usize,
+}
+
+/// Flashbots configuration
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlashbotsConfig {
+    /// Flashbots relay URL
+    #[serde(default = "default_flashbots_relay")]
+    pub relay_url: String,
+
+    /// List of block builders to submit to
+    #[serde(default = "default_builders")]
+    pub builders: Vec<String>,
+
+    /// Bundle submission timeout in milliseconds
+    #[serde(default = "default_bundle_timeout")]
+    pub bundle_timeout_ms: u64,
+
+    /// Enable MEV-Share
+    #[serde(default)]
+    pub mev_share_enabled: bool,
 }
 
 /// Ethereum network and provider configuration
@@ -131,14 +181,6 @@ pub struct ExecutionConfig {
     /// Dry run mode (simulate but don't execute)
     #[serde(default = "default_true")]
     pub dry_run: bool,
-
-    /// Private key for signing transactions (use env var PRIVATE_KEY instead)
-    #[serde(default)]
-    pub private_key: Option<String>,
-
-    /// Flashbots relay URL
-    #[serde(default = "default_flashbots_relay")]
-    pub flashbots_relay_url: String,
 
     /// Use Flashbots for bundle submission
     #[serde(default)]
@@ -286,8 +328,29 @@ fn default_poll_interval() -> u64 {
     100
 }
 
+fn default_simulation_timeout() -> u64 {
+    500
+}
+
+fn default_simulation_workers() -> usize {
+    4
+}
+
 fn default_flashbots_relay() -> String {
     "https://relay.flashbots.net".to_string()
+}
+
+fn default_builders() -> Vec<String> {
+    vec![
+        "flashbots".to_string(),
+        "bloxroute_maxprofit".to_string(),
+        "builder0x69".to_string(),
+        "rsync".to_string(),
+    ]
+}
+
+fn default_bundle_timeout() -> u64 {
+    5000
 }
 
 fn default_max_priority_fee() -> u64 {
@@ -330,15 +393,25 @@ fn default_log_file() -> String {
     "logs/mev_monitor.log".to_string()
 }
 
-impl Default for Config {
+impl Default for SimulationConfig {
     fn default() -> Self {
         Self {
-            ethereum: EthereumConfig::default(),
-            database: DatabaseConfig::default(),
-            monitoring: MonitoringConfig::default(),
-            execution: ExecutionConfig::default(),
-            dashboard: DashboardConfig::default(),
-            logging: LoggingConfig::default(),
+            enabled: false,
+            fork_block: None,
+            timeout_ms: default_simulation_timeout(),
+            parallel: true,
+            workers: default_simulation_workers(),
+        }
+    }
+}
+
+impl Default for FlashbotsConfig {
+    fn default() -> Self {
+        Self {
+            relay_url: default_flashbots_relay(),
+            builders: default_builders(),
+            bundle_timeout_ms: default_bundle_timeout(),
+            mev_share_enabled: false,
         }
     }
 }
@@ -390,8 +463,6 @@ impl Default for ExecutionConfig {
         Self {
             enabled: false,
             dry_run: true,
-            private_key: None,
-            flashbots_relay_url: default_flashbots_relay(),
             use_flashbots: false,
             max_priority_fee_gwei: default_max_priority_fee(),
             gas_limit_multiplier: default_gas_multiplier(),
@@ -476,12 +547,9 @@ impl Config {
             self.database.path = path;
         }
 
-        // Execution overrides
-        if let Ok(key) = std::env::var("PRIVATE_KEY") {
-            self.execution.private_key = Some(key);
-        }
+        // Flashbots overrides
         if let Ok(relay) = std::env::var("FLASHBOTS_RELAY_URL") {
-            self.execution.flashbots_relay_url = relay;
+            self.flashbots.relay_url = relay;
         }
 
         // Dashboard overrides
@@ -508,6 +576,13 @@ impl Config {
         Ok(())
     }
 
+    /// Get private key from environment variable only (never from config file)
+    pub fn get_private_key() -> Option<String> {
+        std::env::var("PRIVATE_KEY")
+            .ok()
+            .or_else(|| std::env::var("MEV_PRIVATE_KEY").ok())
+    }
+
     /// Validate configuration values
     fn validate(&self) -> ConfigResult<()> {
         // Validate chain ID
@@ -518,11 +593,27 @@ impl Config {
             });
         }
 
-        // Validate RPC URLs
+        // Validate RPC URLs with proper URL parsing
         if self.ethereum.http_rpc_url.is_empty() {
             return Err(ConfigError::MissingField(
                 "ethereum.http_rpc_url".to_string(),
             ));
+        }
+
+        url::Url::parse(&self.ethereum.http_rpc_url).map_err(|e| {
+            ConfigError::InvalidValue {
+                field: "ethereum.http_rpc_url".to_string(),
+                message: format!("Invalid URL: {}", e),
+            }
+        })?;
+
+        if !self.ethereum.ws_rpc_url.is_empty() {
+            url::Url::parse(&self.ethereum.ws_rpc_url).map_err(|e| {
+                ConfigError::InvalidValue {
+                    field: "ethereum.ws_rpc_url".to_string(),
+                    message: format!("Invalid URL: {}", e),
+                }
+            })?;
         }
 
         // Validate gas settings

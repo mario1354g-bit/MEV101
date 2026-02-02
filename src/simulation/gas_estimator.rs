@@ -109,6 +109,7 @@ where
     }
 
     /// Estimate the total gas cost for an opportunity in wei.
+    /// Uses historical averages adjusted for swap complexity, with dynamic gas prices.
     pub async fn estimate_gas_cost(
         &self,
         opp: &Opportunity,
@@ -117,22 +118,52 @@ where
         let priority_fee = self.get_priority_fee().await?;
         let gas_units = self.get_gas_units(&opp.opportunity_type);
 
-        // Adjust gas based on complexity (number of swaps)
+        // Adjust gas based on complexity (number of swaps) and pool types
         let adjusted_gas = self.adjust_gas_for_complexity(gas_units, opp);
 
+        // Apply additional adjustments based on swap characteristics
+        let final_gas = self.adjust_for_swap_types(adjusted_gas, opp);
+
         let total_gas_price = base_fee + priority_fee;
-        let gas_cost = U256::from(adjusted_gas) * total_gas_price;
+        let gas_cost = U256::from(final_gas) * total_gas_price;
 
         debug!(
             opportunity_type = %opp.opportunity_type,
             base_fee = %base_fee,
             priority_fee = %priority_fee,
-            gas_units = adjusted_gas,
+            gas_units = final_gas,
             gas_cost_wei = %gas_cost,
             "Estimated gas cost"
         );
 
         Ok(gas_cost)
+    }
+
+    /// Adjust gas estimate based on swap types (V2 vs V3, tick crossings, etc.)
+    fn adjust_for_swap_types(&self, base_gas: u64, opp: &Opportunity) -> u64 {
+        let mut adjusted = base_gas;
+
+        for swap in &opp.swaps {
+            // V3 swaps use more gas than V2, especially with tick crossings
+            if swap.fee.is_some() {
+                // V3 swap detected (has fee parameter)
+                // V3 base swap is ~130k, vs V2 ~100k
+                // Add extra for potential tick crossings (~20k per tick)
+                adjusted += 30_000; // V3 overhead
+                // Estimate tick crossings based on amount (larger trades = more ticks)
+                // This is a rough heuristic; real tick crossing detection requires pool state
+                if swap.amount_in > U256::from(10_000_000_000_000_000_000u128) {
+                    // > 10 ETH equivalent
+                    adjusted += 60_000; // Estimate 3 tick crossings
+                } else if swap.amount_in > U256::from(1_000_000_000_000_000_000u128) {
+                    // > 1 ETH
+                    adjusted += 20_000; // Estimate 1 tick crossing
+                }
+            }
+        }
+
+        // Add 15% safety buffer for gas price volatility and execution variance
+        adjusted + (adjusted * 15 / 100)
     }
 
     /// Estimate gas cost with a specific gas price.
@@ -328,21 +359,74 @@ where
     }
 
     /// Estimate priority fee from recent block history.
+    /// Uses eth_feeHistory for efficient fee estimation instead of fetching individual receipts.
     async fn estimate_priority_fee_from_history(&self) -> Result<U256, SimulationError> {
         // Fallback to a reasonable default if we can't get historical data
         // This is around 2 gwei which is typical for non-urgent transactions
         let default_priority = U256::from(2_000_000_000u64);
 
-        // Try to get recent blocks and analyze priority fees
+        // Try to use eth_feeHistory RPC method for efficient fee estimation
+        // This returns historical gas data in a single call
+        match self.get_fee_history_priority().await {
+            Ok(priority) => Ok(priority),
+            Err(_) => {
+                // Fallback to sampling recent blocks if feeHistory fails
+                let fallback = self.estimate_priority_fee_from_blocks().await
+                    .unwrap_or(default_priority);
+                Ok(fallback)
+            }
+        }
+    }
+
+    /// Get priority fee using eth_feeHistory RPC method.
+    async fn get_fee_history_priority(&self) -> Result<U256, SimulationError> {
+        // Request fee history for last 10 blocks with 25th, 50th, and 75th percentile rewards
+        let fee_history = self
+            .provider
+            .get_fee_history(
+                10,
+                alloy::eips::BlockNumberOrTag::Latest,
+                &[25.0, 50.0, 75.0],
+            )
+            .await
+            .map_err(|e| SimulationError::GasEstimationFailed(format!("Fee history failed: {}", e)))?;
+
+        // Extract median (50th percentile) priority fees from each block
+        let rewards = match &fee_history.reward {
+            Some(r) if !r.is_empty() => r,
+            _ => return Err(SimulationError::GasEstimationFailed("No reward data".to_string())),
+        };
+
+        // Get 50th percentile (index 1) from each block and find median
+        let mut median_rewards: Vec<U256> = rewards
+            .iter()
+            .filter_map(|r| r.get(1).map(|v| U256::from(*v)))
+            .collect();
+
+        if median_rewards.is_empty() {
+            return Err(SimulationError::GasEstimationFailed("No median rewards".to_string()));
+        }
+
+        median_rewards.sort();
+        let median_idx = median_rewards.len() / 2;
+        Ok(median_rewards[median_idx])
+    }
+
+    /// Fallback: estimate priority fee by sampling a few recent blocks.
+    /// More efficient than the previous method - only samples a few transactions per block.
+    async fn estimate_priority_fee_from_blocks(&self) -> Result<U256, SimulationError> {
+        let default_priority = U256::from(2_000_000_000u64);
+
         let latest_block = self
             .provider
             .get_block_number()
             .await
             .map_err(|e| SimulationError::GasEstimationFailed(e.to_string()))?;
 
-        // Get the last few blocks to analyze
         let mut priority_fees = Vec::new();
-        for i in 0..5 {
+
+        // Sample only 3 recent blocks
+        for i in 0..3 {
             if latest_block < i {
                 break;
             }
@@ -354,8 +438,10 @@ where
                 .await
             {
                 if let Some(base_fee) = block.header.base_fee_per_gas {
-                    // Get transactions and estimate their priority fees
-                    for tx_hash in block.transactions.hashes() {
+                    // Sample only first 5 transactions per block to limit RPC calls
+                    let tx_hashes: Vec<_> = block.transactions.hashes().take(5).collect();
+
+                    for tx_hash in tx_hashes {
                         if let Ok(Some(receipt)) = self.provider.get_transaction_receipt(tx_hash).await {
                             let effective_gas_price = receipt.effective_gas_price;
                             let priority = effective_gas_price.saturating_sub(base_fee as u128);

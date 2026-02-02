@@ -502,12 +502,13 @@ fn calculate_confidence(result: &ArbitrageResult) -> f64 {
         confidence *= 1.1;
     }
 
-    confidence.min(1.0_f64).max(0.1_f64)
+    confidence.clamp(0.1_f64, 1.0_f64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloy::primitives::Address;
 
     fn create_test_pool(
         address: Address,
@@ -526,6 +527,7 @@ mod tests {
             reserve1,
             fee_bps: 30,
             last_updated: Utc::now(),
+            last_block: 0,
         }
     }
 

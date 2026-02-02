@@ -269,14 +269,23 @@ pub struct SwapParams {
 pub enum MonitorEvent {
     /// New block received
     NewBlock(BlockInfo),
-    /// Pending transaction detected
-    PendingTransaction(Transaction),
+    /// Pending transaction detected (boxed to reduce enum size)
+    PendingTransaction(Box<Transaction>),
     /// Price update detected
     PriceUpdate(PriceUpdate),
     /// Liquidity change detected
     LiquidityChange(LiquidityEvent),
     /// Liquidation candidate detected
     LiquidationCandidate(LiquidationInfo),
+    /// Chain reorganization detected
+    ChainReorg {
+        /// Previous head block number
+        old_head: u64,
+        /// New head block number after reorg
+        new_head: u64,
+        /// Depth of the reorganization
+        depth: u64,
+    },
 }
 
 /// Configuration for WebSocket reconnection
@@ -308,8 +317,7 @@ impl ReconnectConfig {
     pub fn delay_for_attempt(&self, attempt: u32) -> Duration {
         let delay_ms = self.initial_delay.as_millis() as f64
             * self.multiplier.powi(attempt as i32);
-        let delay = Duration::from_millis(delay_ms.min(self.max_delay.as_millis() as f64) as u64);
-        delay
+        Duration::from_millis(delay_ms.min(self.max_delay.as_millis() as f64) as u64)
     }
 
     /// Check if we should continue trying to reconnect

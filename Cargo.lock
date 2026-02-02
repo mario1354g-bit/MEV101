@@ -2306,6 +2306,7 @@ dependencies = [
  "eyre",
  "futures",
  "hex",
+ "num_cpus",
  "reqwest",
  "serde",
  "serde_json",

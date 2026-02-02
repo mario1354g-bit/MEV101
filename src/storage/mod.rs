@@ -50,7 +50,7 @@ impl Database {
     /// A new Database instance with an active connection pool.
     pub async fn new(path: &str) -> Result<Self> {
         let options = SqliteConnectOptions::from_str(path)
-            .map_err(|e| StorageError::Database(e))?
+            .map_err(StorageError::Database)?
             .create_if_missing(true)
             .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .synchronous(sqlx::sqlite::SqliteSynchronous::Normal)
@@ -164,67 +164,72 @@ impl Database {
         &self,
         filter: &OpportunityFilter,
     ) -> Result<Vec<Opportunity>> {
-        let mut query = String::from("SELECT * FROM opportunities WHERE 1=1");
-        let mut bindings: Vec<String> = Vec::new();
+        use sqlx::QueryBuilder;
+
+        let mut builder: QueryBuilder<sqlx::Sqlite> =
+            QueryBuilder::new("SELECT * FROM opportunities WHERE 1=1");
 
         if let Some(ref opp_type) = filter.opportunity_type {
-            query.push_str(" AND opportunity_type = ?");
-            bindings.push(opp_type.as_str().to_string());
+            builder.push(" AND opportunity_type = ");
+            builder.push_bind(opp_type.as_str().to_string());
         }
 
         if let Some(ref min_profit) = filter.min_profit_wei {
-            query.push_str(" AND CAST(estimated_net_profit_wei AS INTEGER) >= ?");
-            bindings.push(min_profit.clone());
+            builder.push(" AND CAST(estimated_net_profit_wei AS INTEGER) >= ");
+            builder.push_bind(min_profit.clone());
         }
 
         if let Some(from_ts) = filter.from_timestamp {
-            query.push_str(&format!(" AND timestamp >= {}", from_ts));
+            builder.push(" AND timestamp >= ");
+            builder.push_bind(from_ts);
         }
 
         if let Some(to_ts) = filter.to_timestamp {
-            query.push_str(&format!(" AND timestamp <= {}", to_ts));
+            builder.push(" AND timestamp <= ");
+            builder.push_bind(to_ts);
         }
 
         if let Some(from_block) = filter.from_block {
-            query.push_str(&format!(" AND block_number_detected >= {}", from_block));
+            builder.push(" AND block_number_detected >= ");
+            builder.push_bind(from_block);
         }
 
         if let Some(to_block) = filter.to_block {
-            query.push_str(&format!(" AND block_number_detected <= {}", to_block));
+            builder.push(" AND block_number_detected <= ");
+            builder.push_bind(to_block);
         }
 
         if let Some(simulated) = filter.simulated {
-            query.push_str(&format!(" AND simulated = {}", simulated as i32));
+            builder.push(" AND simulated = ");
+            builder.push_bind(simulated as i32);
         }
 
         if let Some(executed) = filter.executed {
-            query.push_str(&format!(" AND executed = {}", executed as i32));
+            builder.push(" AND executed = ");
+            builder.push_bind(executed as i32);
         }
 
         if let Some(captured) = filter.captured_by_competitor {
-            query.push_str(&format!(
-                " AND captured_by_competitor = {}",
-                captured as i32
-            ));
+            builder.push(" AND captured_by_competitor = ");
+            builder.push_bind(captured as i32);
         }
 
-        query.push_str(" ORDER BY timestamp DESC");
+        builder.push(" ORDER BY timestamp DESC");
 
         if let Some(limit) = filter.limit {
-            query.push_str(&format!(" LIMIT {}", limit));
+            builder.push(" LIMIT ");
+            builder.push_bind(limit);
         }
 
         if let Some(offset) = filter.offset {
-            query.push_str(&format!(" OFFSET {}", offset));
+            builder.push(" OFFSET ");
+            builder.push_bind(offset);
         }
 
-        let mut q = sqlx::query_as::<_, Opportunity>(&query);
-
-        for binding in &bindings {
-            q = q.bind(binding);
-        }
-
-        let opportunities = q.fetch_all(&self.pool).await?;
+        let opportunities = builder
+            .build_query_as::<Opportunity>()
+            .fetch_all(&self.pool)
+            .await?;
         Ok(opportunities)
     }
 
@@ -538,6 +543,7 @@ impl Database {
     }
 
     /// Update execution with confirmation details.
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_execution_confirmed(
         &self,
         tx_hash: &str,

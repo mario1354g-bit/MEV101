@@ -36,7 +36,7 @@ impl MultihopDetector {
     }
 
     pub fn with_max_hops(mut self, hops: usize) -> Self {
-        self.max_hops = hops.min(6).max(2); // Clamp between 2 and 6
+        self.max_hops = hops.clamp(2, 6);
         self
     }
 
@@ -134,6 +134,8 @@ impl MultihopDetector {
     }
 
     /// Bellman-Ford algorithm to find a negative cycle
+    /// Fixed: Run full n-1 iterations to properly detect all negative cycles,
+    /// then filter by max_hops during cycle reconstruction
     fn bellman_ford_find_cycle(&self, graph: &PriceGraph, start: Address) -> Option<Cycle> {
         let tokens: Vec<Address> = graph.nodes().collect();
         let n = tokens.len();
@@ -151,8 +153,9 @@ impl MultihopDetector {
         }
         dist.insert(start, 0.0);
 
-        // Relax edges n-1 times
-        for _ in 0..n.min(self.max_hops) {
+        // Relax edges n-1 times (full Bellman-Ford, not limited by max_hops)
+        // This is necessary to properly detect all negative cycles
+        for _ in 0..n.saturating_sub(1) {
             let mut updated = false;
             for token in &tokens {
                 if let Some(edges) = graph.edges_from(*token) {
@@ -173,6 +176,7 @@ impl MultihopDetector {
                     }
                 }
             }
+            // Early termination if no updates (graph is stable)
             if !updated {
                 break;
             }
@@ -191,8 +195,13 @@ impl MultihopDetector {
                     let current = dist.get(&edge.to).copied().unwrap_or(f64::INFINITY);
 
                     if new_dist < current {
-                        // Found negative cycle - reconstruct it
-                        return self.reconstruct_cycle(graph, &pred, edge.to);
+                        // Found negative cycle - reconstruct and filter by hop count
+                        if let Some(cycle) = self.reconstruct_cycle(graph, &pred, edge.to) {
+                            // Filter by max_hops constraint
+                            if cycle.edges.len() <= self.max_hops {
+                                return Some(cycle);
+                            }
+                        }
                     }
                 }
             }
@@ -224,6 +233,7 @@ impl MultihopDetector {
     }
 
     /// DFS helper to find profitable cycles
+    #[allow(clippy::too_many_arguments)]
     fn dfs_find_cycles(
         &self,
         graph: &PriceGraph,
@@ -533,7 +543,7 @@ impl MultihopDetector {
             confidence += 0.05;
         }
 
-        confidence.min(0.95).max(0.3)
+        confidence.clamp(0.3, 0.95)
     }
 }
 
@@ -654,6 +664,7 @@ impl PriceGraph {
 /// Edge in the price graph
 #[derive(Clone)]
 struct GraphEdge {
+    #[allow(dead_code)] // Reserved for graph traversal debugging
     from: Address,
     to: Address,
     /// Weight = -ln(exchange_rate)
@@ -695,6 +706,7 @@ mod tests {
             reserve1: U256::from(reserve1),
             fee_bps: 30,
             last_updated: Utc::now(),
+            last_block: 0,
         }
     }
 

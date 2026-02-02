@@ -158,7 +158,7 @@ impl BackrunExecutor {
             .get("router")
             .and_then(|v| v.as_str())
             .and_then(|s| s.parse::<Address>().ok())
-            .unwrap_or_else(|| target_tx.to);
+            .unwrap_or(target_tx.to);
 
         let protocol = metadata
             .get("protocol")
@@ -319,9 +319,13 @@ impl BackrunExecutor {
             .map_err(|e| MevError::Execution(ExecutionError::SubmissionFailed(e.to_string())))?;
 
         // Create bundle with backrun following target tx
-        // Note: We submit our tx and reference the target by hash
-        let bundle = FlashbotsBundle::new(vec![signed_backrun], block_number + 1)
-            .with_revert_on_fail(ctx.config.revert_on_fail);
+        // The target tx is referenced by hash so our backrun executes after it
+        let bundle = FlashbotsBundle::with_target_tx_hash(
+            vec![signed_backrun],
+            backrun_data.target_tx_hash,
+            block_number + 1,
+        )
+        .with_revert_on_fail(ctx.config.revert_on_fail);
 
         // Simulate bundle
         let sim_result = ctx.flashbots.simulate_bundle(bundle.clone()).await?;
@@ -617,15 +621,9 @@ pub fn estimate_backrun_profit(
     let reserve_out_after = reserve_out - target_out;
 
     // Backrun trade (opposite direction - sell token_out to get token_in)
-    let backrun_out = (backrun_amount * reserve_in_after * fee_factor)
-        / (reserve_out_after * fee_denom + backrun_amount * fee_factor);
-
-    // Profit depends on the specific arbitrage setup
-    // For simple case: we bought token_out elsewhere cheaper and sell here
-    // Profit = backrun_out - cost_of_backrun_amount_elsewhere
-
     // Return the output as a proxy for potential profit
-    backrun_out
+    (backrun_amount * reserve_in_after * fee_factor)
+        / (reserve_out_after * fee_denom + backrun_amount * fee_factor)
 }
 
 #[cfg(test)]

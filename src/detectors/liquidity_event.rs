@@ -227,7 +227,7 @@ impl LiquidityEventDetector {
                 f64::INFINITY
             };
 
-            if price_ratio > 1_000_000.0 || price_ratio < 0.000001 {
+            if !(0.000001..=1_000_000.0).contains(&price_ratio) {
                 flags.extreme_price = true;
                 flags.risk_score += 30;
             }
@@ -250,7 +250,7 @@ impl LiquidityEventDetector {
 
     /// Record suspicious activity for a pool
     pub fn record_suspicious_activity(&self, pool: Address, activity: SuspiciousActivity) {
-        let mut entry = self.suspicious_pools.entry(pool).or_insert(SuspiciousFlags::default());
+        let mut entry = self.suspicious_pools.entry(pool).or_default();
 
         match activity {
             SuspiciousActivity::FailedSell => {
@@ -718,8 +718,11 @@ impl Detector for LiquidityEventDetector {
 /// Information about a newly created pool
 #[derive(Debug, Clone)]
 struct PoolCreationInfo {
+    #[allow(dead_code)] // Reserved for future use: pool address tracking
     address: Address,
+    #[allow(dead_code)] // Reserved for future use: token pair validation
     token0: Address,
+    #[allow(dead_code)] // Reserved for future use: token pair validation
     token1: Address,
     created_at: DateTime<Utc>,
     initial_reserves: Option<(U256, U256)>,

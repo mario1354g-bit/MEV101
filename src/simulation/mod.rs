@@ -213,6 +213,7 @@ where
     P: Provider<T>,
 {
     /// Ethereum provider
+    #[allow(dead_code)] // Reserved for direct provider calls in future simulations
     provider: Arc<P>,
     /// Gas estimator for cost calculations
     gas_estimator: GasEstimator<T, P>,
@@ -415,6 +416,17 @@ where
     }
 
     /// Simulate a liquidation opportunity.
+    ///
+    /// TODO(liquidation): Implement protocol-specific liquidation simulation
+    /// This stub currently falls back to backrun simulation. Full implementation
+    /// requires:
+    /// - Aave V3: Call `liquidationCall` with health factor checks
+    /// - Compound V3: Call `absorb` with position validation
+    /// - Euler: Protocol-specific liquidation flow
+    /// - Flash loan integration for capital efficiency
+    ///
+    /// Tracking: This needs proper protocol ABI integration and health factor
+    /// calculation before production use.
     async fn simulate_liquidation(
         &self,
         opp: &Opportunity,
@@ -422,7 +434,7 @@ where
     ) -> Result<SimulationResult, MevError> {
         // Liquidation simulation is protocol-specific
         // This is a placeholder for actual liquidation logic
-        warn!("Liquidation simulation not fully implemented");
+        warn!("Liquidation simulation not fully implemented - falling back to backrun simulation");
 
         if opp.swaps.is_empty() {
             return Ok(SimulationResult::failed(

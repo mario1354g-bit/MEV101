@@ -154,6 +154,7 @@ pub struct PriceMonitor {
     /// Current block number
     current_block: AtomicU64,
     /// Reconnection configuration
+    #[allow(dead_code)] // Reserved for WebSocket reconnection logic
     reconnect_config: ReconnectConfig,
 }
 
@@ -298,15 +299,35 @@ impl PriceMonitor {
         (r1 / r0) * decimal_adjustment
     }
 
-    /// Calculate price from V3 sqrtPriceX96
+    /// Calculate price from V3 sqrtPriceX96 with overflow protection
     fn calculate_v3_price(&self, sqrt_price_x96: U256, decimals0: u8, decimals1: u8) -> f64 {
         // price = (sqrtPriceX96 / 2^96)^2
         // price = sqrtPriceX96^2 / 2^192
 
-        let sqrt_price = sqrt_price_x96.to::<u128>() as f64;
-        let two_96 = 2f64.powi(96);
+        if sqrt_price_x96.is_zero() {
+            return 0.0;
+        }
 
-        let price = (sqrt_price / two_96).powi(2);
+        // Calculate bits to check if value fits in u128
+        let bits = 256 - sqrt_price_x96.leading_zeros();
+
+        let price = if bits <= 128 {
+            // Safe path: value fits in u128
+            let sqrt_price = sqrt_price_x96.to::<u128>() as f64;
+            let two_96 = 2f64.powi(96);
+            (sqrt_price / two_96).powi(2)
+        } else {
+            // For very large sqrtPrice values, use logarithmic calculation to avoid overflow
+            // log(price) = 2 * (log(sqrtPriceX96) - 96 * log(2))
+            let shift = bits.saturating_sub(53); // f64 mantissa is 53 bits
+            let shifted = sqrt_price_x96 >> shift;
+            let base = shifted.to::<u128>() as f64;
+
+            // Calculate in log space: log(sqrtPrice) = log(base) + shift * log(2)
+            let log_sqrt = base.ln() + (shift as f64) * 2f64.ln();
+            let log_price = 2.0 * (log_sqrt - 96.0 * 2f64.ln());
+            log_price.exp()
+        };
 
         // Adjust for decimals
         let decimal_adjustment = 10f64.powi(decimals0 as i32 - decimals1 as i32);
@@ -576,32 +597,20 @@ impl PriceMonitor {
     }
 }
 
+/// NOTE: The Monitor trait implementation for PriceMonitor uses unsafe raw pointers
+/// which can cause use-after-free bugs. Use ArcPriceMonitor for safe usage.
 #[async_trait]
 impl Monitor for PriceMonitor {
     fn name(&self) -> &str {
         &self.name
     }
 
-    async fn start(&self, tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
-        if self.running.swap(true, Ordering::Relaxed) {
-            return Err(MevError::Provider(ProviderError::SubscriptionError(
-                "Price monitor is already running".to_string(),
-            )));
-        }
-
-        let (stop_tx, stop_rx) = mpsc::channel(1);
-        {
-            let mut guard = self.stop_tx.write().await;
-            *guard = Some(stop_tx);
-        }
-
-        let self_ref = unsafe { &*(self as *const PriceMonitor) };
-
-        tokio::spawn(async move {
-            self_ref.run_monitoring_loop(tx, stop_rx).await;
-        });
-
-        Ok(())
+    async fn start(&self, _tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
+        // This implementation is deprecated due to safety concerns.
+        // Use ArcPriceMonitor::start() instead which uses safe Arc-based patterns.
+        Err(MevError::Provider(ProviderError::SubscriptionError(
+            "Direct PriceMonitor::start() is unsafe. Use ArcPriceMonitor instead.".to_string(),
+        )))
     }
 
     async fn stop(&self) -> Result<()> {

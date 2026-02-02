@@ -20,6 +20,7 @@ use super::{
 use crate::error::Result;
 
 /// Known function selectors for swap functions
+#[allow(dead_code)] // DEX selectors reserved for extended swap detection
 mod selectors {
     pub const UNISWAP_V2_SWAP_EXACT_TOKENS: &[u8] = &[0x38, 0xed, 0x17, 0x39];
     pub const UNISWAP_V2_SWAP_TOKENS_EXACT: &[u8] = &[0x8a, 0x65, 0x7e, 0x67];
@@ -435,6 +436,7 @@ impl SandwichDetector {
     }
 
     /// Build opportunity from analysis
+    #[allow(clippy::too_many_arguments)]
     fn build_opportunity(
         &self,
         analysis: &SandwichAnalysis,
@@ -449,6 +451,9 @@ impl SandwichDetector {
 
         // Frontrun: buy token_out before victim
         // Backrun: sell token_out after victim
+        // Slippage protection: backrun must cover input + gas costs + minimum profit margin
+        let min_backrun_out = analysis.frontrun_amount + analysis.gas_cost;
+
         let swap_path = vec![
             SwapStep {
                 pool: analysis.pool.address,
@@ -465,7 +470,8 @@ impl SandwichDetector {
                 token_in: decoded.token_out,
                 token_out: decoded.token_in,
                 amount_in: analysis.frontrun_output,
-                min_amount_out: analysis.frontrun_amount, // At minimum get back input
+                // Must cover input + gas costs to prevent losses
+                min_amount_out: min_backrun_out,
             },
         ];
 
@@ -559,7 +565,7 @@ impl SandwichDetector {
             confidence += 0.05;
         }
 
-        confidence.min(0.95_f64).max(0.3_f64)
+        confidence.clamp(0.3_f64, 0.95_f64)
     }
 }
 
@@ -606,6 +612,23 @@ impl Detector for SandwichDetector {
                 Some(d) => d,
                 None => return Ok(opportunities),
             };
+
+            // Check deadline validity - need at least 2 blocks worth of time (24 seconds on mainnet)
+            let current_timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+
+            let deadline_secs = decoded.deadline.to::<u64>();
+            // Skip if deadline is 0 (no deadline) or too soon
+            if deadline_secs > 0 && deadline_secs < current_timestamp + 24 {
+                tracing::debug!(
+                    "Transaction deadline too close: {} (current: {})",
+                    deadline_secs,
+                    current_timestamp
+                );
+                return Ok(opportunities);
+            }
 
             // Check if swap size is in our target range
             if decoded.amount_in < self.min_victim_size || decoded.amount_in > self.max_victim_size {
@@ -660,6 +683,7 @@ struct SandwichAnalysis {
     pool: super::RegisteredPool,
     frontrun_amount: U256,
     frontrun_output: U256,
+    #[allow(dead_code)] // Reserved for detailed profit breakdown reporting
     backrun_output: U256,
     estimated_profit: U256,
     gas_cost: U256,

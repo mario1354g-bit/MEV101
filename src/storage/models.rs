@@ -36,7 +36,7 @@ impl OpportunityType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "price_discrepancy" => Some(OpportunityType::PriceDiscrepancy),
             "multi_hop" => Some(OpportunityType::MultiHop),
@@ -235,7 +235,7 @@ impl ExecutionStatus {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "pending" => Some(ExecutionStatus::Pending),
             "confirmed" => Some(ExecutionStatus::Confirmed),

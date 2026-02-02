@@ -267,6 +267,7 @@ impl RouterEncoder {
     }
 
     /// Encode a Uniswap V2 addLiquidity call.
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_v2_add_liquidity(
         token_a: Address,
         token_b: Address,
@@ -339,13 +340,19 @@ impl RouterEncoder {
         } else {
             Uint::from_limbs_slice(&sqrt_price_limit.as_limbs()[..3])
         };
+        // Use current timestamp + 2 minutes as deadline to prevent stale execution
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| U256::from(d.as_secs() + 120))
+            .unwrap_or(U256::MAX);
+
         let call = ISwapRouter::exactInputSingleCall {
             params: ISwapRouter::ExactInputSingleParams {
                 tokenIn: token_in,
                 tokenOut: token_out,
                 fee: fee_u24,
                 recipient,
-                deadline: U256::MAX, // Use MAX for deadline
+                deadline,
                 amountIn: amount_in,
                 amountOutMinimum: amount_out_min,
                 sqrtPriceLimitX96: sqrt_limit,
@@ -367,11 +374,17 @@ impl RouterEncoder {
         amount_in: U256,
         amount_out_min: U256,
     ) -> Bytes {
+        // Use current timestamp + 2 minutes as deadline
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| U256::from(d.as_secs() + 120))
+            .unwrap_or(U256::MAX);
+
         let call = ISwapRouter::exactInputCall {
             params: ISwapRouter::ExactInputParams {
                 path,
                 recipient,
-                deadline: U256::MAX,
+                deadline,
                 amountIn: amount_in,
                 amountOutMinimum: amount_out_min,
             },
@@ -395,13 +408,20 @@ impl RouterEncoder {
         } else {
             Uint::from_limbs_slice(&sqrt_price_limit.as_limbs()[..3])
         };
+
+        // Use current timestamp + 2 minutes as deadline
+        let deadline = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| U256::from(d.as_secs() + 120))
+            .unwrap_or(U256::MAX);
+
         let call = ISwapRouter::exactOutputSingleCall {
             params: ISwapRouter::ExactOutputSingleParams {
                 tokenIn: token_in,
                 tokenOut: token_out,
                 fee: fee_u24,
                 recipient,
-                deadline: U256::MAX,
+                deadline,
                 amountOut: amount_out,
                 amountInMaximum: amount_in_max,
                 sqrtPriceLimitX96: sqrt_limit,
@@ -427,7 +447,7 @@ impl RouterEncoder {
             path.extend_from_slice(token.as_slice());
             if i < fees.len() {
                 // Fee is encoded as 3 bytes (24 bits)
-                let fee_bytes = (fees[i] as u32).to_be_bytes();
+                let fee_bytes = fees[i].to_be_bytes();
                 path.extend_from_slice(&fee_bytes[1..4]); // Take last 3 bytes
             }
         }

@@ -77,9 +77,18 @@ impl FlashbotsClient {
         self.signer.address()
     }
 
-    /// Sign a message for Flashbots authentication.
+    /// Sign a message for Flashbots authentication using EIP-191 personal_sign format.
+    ///
+    /// Flashbots expects the signature to use EIP-191 format:
+    /// `\x19Ethereum Signed Message:\n<length><message>`
     async fn sign_payload(&self, payload: &str) -> Result<String> {
-        let message_hash = keccak256(payload.as_bytes());
+        // EIP-191: Prefix the message with the standard Ethereum signed message prefix
+        let prefixed_message = format!(
+            "\x19Ethereum Signed Message:\n{}{}",
+            payload.len(),
+            payload
+        );
+        let message_hash = keccak256(prefixed_message.as_bytes());
         let signature = self.signer.sign_hash(&message_hash).await
             .map_err(|e| MevError::Execution(ExecutionError::SignerError(e.to_string())))?;
 
@@ -151,7 +160,7 @@ impl FlashbotsClient {
         })
     }
 
-    /// Send a bundle to Flashbots for inclusion.
+    /// Send a bundle to Flashbots for inclusion with retry logic.
     ///
     /// # Arguments
     /// * `bundle` - The transaction bundle to submit
@@ -160,6 +169,46 @@ impl FlashbotsClient {
     /// The bundle response containing the bundle hash
     #[instrument(skip(self, bundle), fields(block_number = bundle.block_number))]
     pub async fn send_bundle(&self, bundle: FlashbotsBundle) -> Result<BundleResponse> {
+        self.send_bundle_with_retries(bundle, 3).await
+    }
+
+    /// Send a bundle with configurable retry count.
+    async fn send_bundle_with_retries(
+        &self,
+        bundle: FlashbotsBundle,
+        max_retries: u8,
+    ) -> Result<BundleResponse> {
+        let mut last_error = None;
+
+        for attempt in 0..=max_retries {
+            match self.send_bundle_internal(&bundle).await {
+                Ok(response) => return Ok(response),
+                Err(e) => {
+                    debug!(
+                        attempt = attempt,
+                        max_retries = max_retries,
+                        error = %e,
+                        "Bundle submission attempt failed"
+                    );
+                    last_error = Some(e);
+                    if attempt < max_retries {
+                        // Exponential backoff: 100ms, 200ms, 400ms, etc.
+                        let delay_ms = 100 * (1 << attempt);
+                        tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    }
+                }
+            }
+        }
+
+        Err(last_error.unwrap_or_else(|| {
+            MevError::Execution(ExecutionError::BundleFailed(
+                "All retry attempts exhausted".to_string(),
+            ))
+        }))
+    }
+
+    /// Internal bundle submission without retries.
+    async fn send_bundle_internal(&self, bundle: &FlashbotsBundle) -> Result<BundleResponse> {
         let txs: Vec<String> = bundle
             .txs
             .iter()
@@ -172,7 +221,7 @@ impl FlashbotsClient {
             min_timestamp: bundle.min_timestamp,
             max_timestamp: bundle.max_timestamp,
             revert_on_fail: Some(bundle.revert_on_fail),
-            replacement_uuid: None,
+            replacement_uuid: bundle.replacement_uuid.clone(),
         };
 
         info!(
@@ -411,6 +460,9 @@ impl FlashbotsClient {
 pub struct FlashbotsBundle {
     /// Signed, RLP-encoded transactions
     pub txs: Vec<Bytes>,
+    /// Transaction hashes to include in the bundle (for referencing mempool txs)
+    /// These are used for sandwich/backrun bundles to reference target transactions
+    pub tx_hashes: Vec<B256>,
     /// Target block number for inclusion
     pub block_number: u64,
     /// Minimum timestamp for bundle validity
@@ -419,6 +471,8 @@ pub struct FlashbotsBundle {
     pub max_timestamp: Option<u64>,
     /// Whether to revert the entire bundle if any tx fails
     pub revert_on_fail: bool,
+    /// UUID for bundle replacement/cancellation
+    pub replacement_uuid: Option<String>,
 }
 
 impl FlashbotsBundle {
@@ -426,11 +480,52 @@ impl FlashbotsBundle {
     pub fn new(txs: Vec<Bytes>, block_number: u64) -> Self {
         Self {
             txs,
+            tx_hashes: Vec::new(),
             block_number,
             min_timestamp: None,
             max_timestamp: None,
             revert_on_fail: true,
+            replacement_uuid: None,
         }
+    }
+
+    /// Create a bundle that references a mempool transaction by hash.
+    /// This is used for backrun bundles where we want to execute after a target tx.
+    pub fn with_target_tx_hash(txs: Vec<Bytes>, target_tx_hash: B256, block_number: u64) -> Self {
+        Self {
+            txs,
+            tx_hashes: vec![target_tx_hash],
+            block_number,
+            min_timestamp: None,
+            max_timestamp: None,
+            revert_on_fail: true,
+            replacement_uuid: None,
+        }
+    }
+
+    /// Create a sandwich bundle with frontrun, victim hash, and backrun.
+    /// The bundle order will be: [frontrun_tx, victim_tx (by hash), backrun_tx]
+    pub fn sandwich(
+        frontrun_tx: Bytes,
+        victim_tx_hash: B256,
+        backrun_tx: Bytes,
+        block_number: u64,
+    ) -> Self {
+        Self {
+            txs: vec![frontrun_tx, backrun_tx],
+            tx_hashes: vec![victim_tx_hash],
+            block_number,
+            min_timestamp: None,
+            max_timestamp: None,
+            revert_on_fail: true,
+            replacement_uuid: None,
+        }
+    }
+
+    /// Add a transaction hash reference (for mempool transactions).
+    pub fn with_tx_hash(mut self, tx_hash: B256) -> Self {
+        self.tx_hashes.push(tx_hash);
+        self
     }
 
     /// Set timestamp constraints for the bundle.
@@ -446,13 +541,29 @@ impl FlashbotsBundle {
         self
     }
 
-    /// Calculate the bundle hash.
-    pub fn hash(&self) -> B256 {
+    /// Set a replacement UUID for bundle updates/cancellation.
+    pub fn with_replacement_uuid(mut self, uuid: String) -> Self {
+        self.replacement_uuid = Some(uuid);
+        self
+    }
+
+    /// Calculate a local identifier for this bundle.
+    /// Note: This is NOT the same as the bundle hash returned by Flashbots relay.
+    /// The actual bundle hash is computed by the relay and returned in the response.
+    pub fn local_id(&self) -> B256 {
         let mut data = Vec::new();
         for tx in &self.txs {
             data.extend_from_slice(tx);
         }
+        for hash in &self.tx_hashes {
+            data.extend_from_slice(hash.as_slice());
+        }
         keccak256(&data)
+    }
+
+    /// Check if this bundle references any mempool transactions.
+    pub fn has_tx_hash_references(&self) -> bool {
+        !self.tx_hashes.is_empty()
     }
 }
 
@@ -727,17 +838,43 @@ mod tests {
     }
 
     #[test]
-    fn test_bundle_hash() {
+    fn test_bundle_local_id() {
         let tx1 = Bytes::from(vec![1, 2, 3]);
         let tx2 = Bytes::from(vec![4, 5, 6]);
 
         let bundle = FlashbotsBundle::new(vec![tx1.clone(), tx2.clone()], 12345678);
-        let hash1 = bundle.hash();
+        let hash1 = bundle.local_id();
 
-        // Same transactions should produce same hash
+        // Same transactions should produce same local id
         let bundle2 = FlashbotsBundle::new(vec![tx1, tx2], 99999999);
-        let hash2 = bundle2.hash();
+        let hash2 = bundle2.local_id();
 
         assert_eq!(hash1, hash2);
+    }
+
+    #[test]
+    fn test_sandwich_bundle() {
+        let frontrun = Bytes::from(vec![1, 2, 3]);
+        let victim_hash = B256::repeat_byte(0xAB);
+        let backrun = Bytes::from(vec![4, 5, 6]);
+
+        let bundle = FlashbotsBundle::sandwich(frontrun.clone(), victim_hash, backrun.clone(), 12345);
+
+        assert_eq!(bundle.txs.len(), 2);
+        assert_eq!(bundle.tx_hashes.len(), 1);
+        assert_eq!(bundle.tx_hashes[0], victim_hash);
+        assert!(bundle.has_tx_hash_references());
+    }
+
+    #[test]
+    fn test_backrun_bundle() {
+        let backrun_tx = Bytes::from(vec![1, 2, 3]);
+        let target_hash = B256::repeat_byte(0xCD);
+
+        let bundle = FlashbotsBundle::with_target_tx_hash(vec![backrun_tx], target_hash, 12345);
+
+        assert_eq!(bundle.txs.len(), 1);
+        assert_eq!(bundle.tx_hashes.len(), 1);
+        assert_eq!(bundle.tx_hashes[0], target_hash);
     }
 }

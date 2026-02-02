@@ -309,7 +309,17 @@ where
         })
     }
 
-    /// Simulate a sandwich attack.
+    /// Simulate a sandwich attack with state change estimation.
+    ///
+    /// IMPORTANT: This simulation estimates sandwich profitability but has limitations:
+    /// - Each eth_call runs independently without persisting state changes
+    /// - The victim transaction impact is estimated, not simulated
+    /// - For accurate multi-transaction simulation with state persistence, use REVM
+    ///
+    /// The simulation compensates by:
+    /// 1. Estimating price impact from frontrun on backrun execution
+    /// 2. Using victim_impact parameter to estimate victim's contribution to profit
+    /// 3. Adding safety margins to account for state uncertainty
     pub async fn simulate_sandwich(
         &self,
         frontrun: SwapParams,
@@ -349,16 +359,31 @@ where
             )));
         }
 
-        // The victim transaction happens here (we can't simulate it directly)
-        // We estimate its impact on our backrun
+        // LIMITATION: State changes from frontrun don't persist to backrun simulation
+        // We compensate by adjusting the backrun parameters to account for:
+        // 1. Our frontrun's price impact on the pool
+        // 2. The victim's transaction impact
+        //
+        // Estimate price impact from frontrun:
+        // After our buy, the price has moved up, so our sell will get worse execution
+        // We estimate this by reducing expected output by a percentage of our trade size
+        let frontrun_price_impact_estimate = frontrun_result.output_amount / U256::from(100); // ~1% slippage estimate
 
-        // Simulate backrun with adjusted amounts based on victim impact
+        // Simulate backrun with adjusted amounts
+        // The backrun sells the tokens we bought in frontrun
         let mut adjusted_backrun = backrun.clone();
         adjusted_backrun.amount_in = frontrun_result.output_amount;
-        // Adjust expected output considering victim's impact
-        adjusted_backrun.amount_out_min = adjusted_backrun
-            .amount_out_min
-            .saturating_add(victim_impact);
+
+        // Adjust expected output considering:
+        // 1. Price moved against us from our frontrun
+        // 2. Victim pushed price further in our favor (this is our profit source)
+        // Net effect: victim_impact should be positive (we profit from victim's slippage)
+        let adjusted_min_out = if victim_impact > frontrun_price_impact_estimate {
+            adjusted_backrun.amount_out_min.saturating_add(victim_impact - frontrun_price_impact_estimate)
+        } else {
+            adjusted_backrun.amount_out_min.saturating_sub(frontrun_price_impact_estimate - victim_impact)
+        };
+        adjusted_backrun.amount_out_min = adjusted_min_out;
 
         let backrun_data = self.encode_swap_data(&adjusted_backrun)?;
         let backrun_value = if adjusted_backrun.token_in == Address::ZERO {
@@ -385,25 +410,35 @@ where
         }
 
         // Calculate sandwich profit
-        // Profit = backrun output - frontrun input + victim impact extracted
+        // The actual profit comes from: victim moves price in our favor after we buy
+        // Profit = backrun output - frontrun input
+        // We add a conservative estimate based on victim_impact
         let total_input = frontrun.amount_in;
-        let total_output = backrun_result.output_amount;
-        let profit = if total_output >= total_input {
-            I256::try_from(total_output - total_input).unwrap_or(I256::ZERO)
+
+        // Estimate actual backrun output accounting for state changes
+        // Since we can't persist state, we estimate the backrun would get victim_impact more
+        let estimated_actual_output = backrun_result.output_amount.saturating_add(victim_impact);
+
+        let profit = if estimated_actual_output >= total_input {
+            I256::try_from(estimated_actual_output - total_input).unwrap_or(I256::ZERO)
         } else {
-            -I256::try_from(total_input - total_output).unwrap_or(I256::ZERO)
+            -I256::try_from(total_input - estimated_actual_output).unwrap_or(I256::ZERO)
         };
+
+        // Apply safety margin for state uncertainty (reduce profit estimate by 10%)
+        let safe_profit = profit * I256::try_from(90).unwrap_or(I256::ZERO)
+            / I256::try_from(100).unwrap_or(I256::ONE);
 
         let total_gas = frontrun_result.gas_used + backrun_result.gas_used;
         let total_gas_cost = frontrun_result.gas_cost_wei + backrun_result.gas_cost_wei;
 
         Ok(SimulationResult {
             success: true,
-            output_amount: backrun_result.output_amount,
-            profit_wei: profit,
+            output_amount: estimated_actual_output,
+            profit_wei: safe_profit,
             gas_used: total_gas,
             gas_cost_wei: total_gas_cost,
-            net_profit_wei: profit,
+            net_profit_wei: safe_profit,
             revert_reason: None,
             effective_gas_price: frontrun_result.effective_gas_price,
             block_number: frontrun_result.block_number,
@@ -498,8 +533,18 @@ where
     }
 
     /// Encode swap data for a DEX router.
+    /// Automatically detects V2 vs V3 based on fee parameter presence.
     pub fn encode_swap_data(&self, params: &SwapParams) -> Result<Bytes, EthCallError> {
-        // Encode for Uniswap V2 style swapExactTokensForTokens
+        // Check if this is a V3 swap (has fee parameter set)
+        if params.fee.is_some() {
+            self.encode_v3_swap_data(params)
+        } else {
+            self.encode_v2_swap_data(params)
+        }
+    }
+
+    /// Encode swap data for Uniswap V2 style swapExactTokensForTokens.
+    pub fn encode_v2_swap_data(&self, params: &SwapParams) -> Result<Bytes, EthCallError> {
         // Function signature: swapExactTokensForTokens(uint256,uint256,address[],address,uint256)
         let selector = [0x38, 0xed, 0x17, 0x39]; // swapExactTokensForTokens
 
@@ -553,32 +598,89 @@ where
     }
 
     /// Encode swap data for Uniswap V3.
+    /// Supports both single-hop (exactInputSingle) and multi-hop (exactInput) swaps.
     pub fn encode_v3_swap_data(&self, params: &SwapParams) -> Result<Bytes, EthCallError> {
-        // exactInputSingle for single-hop V3 swap
-        // Function: exactInputSingle((address,address,uint24,address,uint256,uint256,uint256,uint160))
-        let selector = [0x41, 0x4b, 0xf3, 0x89]; // exactInputSingle
-
         let fee = params.fee.unwrap_or(3000);
 
-        let mut data = Vec::with_capacity(4 + 32 * 8);
+        // Check if this is a multi-hop swap (more than 2 tokens in path)
+        if params.path.len() > 2 {
+            self.encode_v3_multi_hop_data(params)
+        } else {
+            // Single-hop: exactInputSingle
+            // For SwapRouter02, the struct doesn't include deadline (it's in multicall wrapper)
+            // Using Router02 format: exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
+            let selector = [0x04, 0xe4, 0x5a, 0xaf]; // exactInputSingle (Router02)
+
+            let mut data = Vec::with_capacity(4 + 32 * 7);
+            data.extend_from_slice(&selector);
+
+            // Struct is ABI encoded as a tuple at offset 32
+            data.extend_from_slice(&encode_u256(U256::from(32))); // offset to struct
+
+            // tokenIn
+            data.extend_from_slice(&encode_address(params.token_in));
+            // tokenOut
+            data.extend_from_slice(&encode_address(params.token_out));
+            // fee
+            data.extend_from_slice(&encode_u256(U256::from(fee)));
+            // recipient
+            data.extend_from_slice(&encode_address(params.recipient));
+            // amountIn
+            data.extend_from_slice(&encode_u256(params.amount_in));
+            // amountOutMinimum
+            data.extend_from_slice(&encode_u256(params.amount_out_min));
+            // sqrtPriceLimitX96 (0 = no limit)
+            data.extend_from_slice(&encode_u256(U256::ZERO));
+
+            Ok(Bytes::from(data))
+        }
+    }
+
+    /// Encode multi-hop V3 swap data using exactInput.
+    fn encode_v3_multi_hop_data(&self, params: &SwapParams) -> Result<Bytes, EthCallError> {
+        // exactInput for multi-hop V3 swap (Router02)
+        // Function: exactInput((bytes,address,uint256,uint256))
+        let selector = [0xb8, 0x58, 0x18, 0x3f]; // exactInput (Router02)
+
+        // Build the path: token0 + fee + token1 + fee + token2 ...
+        // Each token is 20 bytes, each fee is 3 bytes
+        let fees = params.fee.unwrap_or(3000);
+        let num_pairs = params.path.len() - 1;
+        let path_len = params.path.len() * 20 + num_pairs * 3;
+
+        let mut path_bytes = Vec::with_capacity(path_len);
+        for (i, token) in params.path.iter().enumerate() {
+            path_bytes.extend_from_slice(token.as_slice());
+            if i < num_pairs {
+                // Add fee (3 bytes, big endian)
+                let fee_bytes = fees.to_be_bytes();
+                path_bytes.extend_from_slice(&fee_bytes[1..4]);
+            }
+        }
+
+        // Build the calldata
+        let mut data = Vec::with_capacity(4 + 32 * 5 + path_bytes.len());
         data.extend_from_slice(&selector);
 
-        // tokenIn
-        data.extend_from_slice(&encode_address(params.token_in));
-        // tokenOut
-        data.extend_from_slice(&encode_address(params.token_out));
-        // fee
-        data.extend_from_slice(&encode_u256(U256::from(fee)));
+        // Struct offset
+        data.extend_from_slice(&encode_u256(U256::from(32)));
+
+        // path offset (relative to struct start)
+        data.extend_from_slice(&encode_u256(U256::from(128))); // 4 * 32
         // recipient
         data.extend_from_slice(&encode_address(params.recipient));
-        // deadline
-        data.extend_from_slice(&encode_u256(params.deadline));
         // amountIn
         data.extend_from_slice(&encode_u256(params.amount_in));
         // amountOutMinimum
         data.extend_from_slice(&encode_u256(params.amount_out_min));
-        // sqrtPriceLimitX96 (0 = no limit)
-        data.extend_from_slice(&encode_u256(U256::ZERO));
+
+        // path length
+        data.extend_from_slice(&encode_u256(U256::from(path_bytes.len())));
+        // path data (padded to 32 bytes)
+        data.extend_from_slice(&path_bytes);
+        // Pad to 32-byte boundary
+        let padding = (32 - (path_bytes.len() % 32)) % 32;
+        data.extend(std::iter::repeat_n(0u8, padding));
 
         Ok(Bytes::from(data))
     }

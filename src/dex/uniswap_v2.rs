@@ -252,7 +252,9 @@ impl UniswapV2 {
         Ok((token0, token1))
     }
 
-    /// Calculate price from reserves
+    /// Calculate price from reserves as f64
+    /// Note: This may lose precision for very large reserves (> 2^53)
+    /// For precise comparisons, use calculate_price_scaled instead
     fn calculate_price(reserve0: U256, reserve1: U256) -> f64 {
         if reserve0.is_zero() {
             return 0.0;
@@ -270,7 +272,35 @@ impl UniswapV2 {
         }
     }
 
+    /// Calculate price ratio as a scaled U256 for full precision
+    /// Returns price scaled by 1e18 (18 decimals) to preserve precision
+    /// Use this for arbitrage detection where small differences matter
+    pub fn calculate_price_scaled(reserve0: U256, reserve1: U256) -> U256 {
+        if reserve0.is_zero() {
+            return U256::ZERO;
+        }
+        // Scale by 1e18 for precision: price = (reserve1 * 1e18) / reserve0
+        let scale = U256::from(1_000_000_000_000_000_000u128); // 1e18
+        (reserve1 * scale) / reserve0
+    }
+
+    /// Compare two prices with a threshold (both scaled by 1e18)
+    /// Returns true if price_a > price_b by at least threshold_bps basis points
+    pub fn price_exceeds_by_bps(price_a_scaled: U256, price_b_scaled: U256, threshold_bps: u32) -> bool {
+        if price_b_scaled.is_zero() {
+            return !price_a_scaled.is_zero();
+        }
+
+        // Check if price_a > price_b * (1 + threshold_bps/10000)
+        // Rearranged to avoid overflow: price_a * 10000 > price_b * (10000 + threshold_bps)
+        let bps_base = U256::from(10_000u32);
+        let threshold = U256::from(threshold_bps);
+
+        price_a_scaled * bps_base > price_b_scaled * (bps_base + threshold)
+    }
+
     /// Decode path from encoded bytes (used in some swap functions)
+    #[allow(dead_code)] // Reserved for extended swap decoding
     fn decode_path(data: &[u8]) -> DexResult<Vec<Address>> {
         if data.len() < 64 {
             return Err(DexError::Decoding("Path data too short".to_string()));

@@ -678,32 +678,20 @@ impl LiquidityMonitor {
     }
 }
 
+/// NOTE: The Monitor trait implementation for LiquidityMonitor uses unsafe raw pointers
+/// which can cause use-after-free bugs. Use ArcLiquidityMonitor for safe usage.
 #[async_trait]
 impl Monitor for LiquidityMonitor {
     fn name(&self) -> &str {
         &self.name
     }
 
-    async fn start(&self, tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
-        if self.running.swap(true, Ordering::Relaxed) {
-            return Err(MevError::Provider(ProviderError::SubscriptionError(
-                "Liquidity monitor is already running".to_string(),
-            )));
-        }
-
-        let (stop_tx, stop_rx) = mpsc::channel(1);
-        {
-            let mut guard = self.stop_tx.write().await;
-            *guard = Some(stop_tx);
-        }
-
-        let self_ref = unsafe { &*(self as *const LiquidityMonitor) };
-
-        tokio::spawn(async move {
-            self_ref.run_monitoring_loop(tx, stop_rx).await;
-        });
-
-        Ok(())
+    async fn start(&self, _tx: mpsc::Sender<MonitorEvent>) -> Result<()> {
+        // This implementation is deprecated due to safety concerns.
+        // Use ArcLiquidityMonitor::start() instead which uses safe Arc-based patterns.
+        Err(MevError::Provider(ProviderError::SubscriptionError(
+            "Direct LiquidityMonitor::start() is unsafe. Use ArcLiquidityMonitor instead.".to_string(),
+        )))
     }
 
     async fn stop(&self) -> Result<()> {
