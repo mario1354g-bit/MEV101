@@ -1,5 +1,10 @@
+mod artemis;
+mod artemis_main;
+mod collectors;
 mod config;
 mod error;
+mod executors;
+mod strategies;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -208,6 +213,40 @@ async fn async_main() -> Result<(), MevError> {
 
     info!("Starting MEV Monitor v{}", env!("CARGO_PKG_VERSION"));
     info!("Chain ID: {}", config.ethereum.chain_id);
+
+    // Check for Artemis mode
+    if config.monitoring.artemis_mode || std::env::var("ARTEMIS_MODE").is_ok() {
+        info!("Running in ARTEMIS mode (Collector -> Strategy -> Executor pipeline)");
+
+        // Get WebSocket URL (prefer Alchemy for reliability)
+        let ws_url = config
+            .ethereum
+            .fallback_ws_url
+            .clone()
+            .unwrap_or_else(|| config.ethereum.ws_rpc_url.clone());
+
+        let rpc_url = config
+            .ethereum
+            .fallback_http_url
+            .clone()
+            .unwrap_or_else(|| config.ethereum.http_rpc_url.clone());
+
+        let signer_key = config::Config::get_private_key().unwrap_or_default();
+        let flashloan_contract = std::env::var("FLASHLOAN_CONTRACT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(alloy::primitives::Address::ZERO);
+
+        return artemis_main::run_artemis(
+            ws_url,
+            rpc_url,
+            signer_key,
+            flashloan_contract,
+            config.execution.dry_run,
+        )
+        .await
+        .map_err(|e| MevError::Provider(ProviderError::RpcError(e.to_string())));
+    }
 
     // Initialize database
     let db = init_database(&config).await?;

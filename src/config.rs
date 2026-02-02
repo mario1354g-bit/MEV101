@@ -142,6 +142,10 @@ pub struct DatabaseConfig {
 /// Monitoring configuration for different MEV strategies
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MonitoringConfig {
+    /// Use Artemis architecture (Collector -> Strategy -> Executor pipeline)
+    #[serde(default)]
+    pub artemis_mode: bool,
+
     /// Enable mempool monitoring
     #[serde(default = "default_true")]
     pub mempool_enabled: bool,
@@ -455,6 +459,7 @@ impl Default for DatabaseConfig {
 impl Default for MonitoringConfig {
     fn default() -> Self {
         Self {
+            artemis_mode: false,
             mempool_enabled: true,
             block_enabled: true,
             dex_enabled: true,
