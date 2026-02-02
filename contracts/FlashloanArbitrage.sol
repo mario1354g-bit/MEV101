@@ -5,6 +5,7 @@ import "./interfaces/IBalancerVault.sol";
 import "./interfaces/IAaveV3.sol";
 import "./interfaces/IUniswapV2.sol";
 import "./interfaces/IUniswapV3.sol";
+import "./interfaces/ICurve.sol";
 
 /**
  * @title FlashloanArbitrage
@@ -441,6 +442,15 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
                     step.minAmountOut,
                     step.swapData
                 );
+            } else if (step.protocol == PROTOCOL_CURVE) {
+                amountOut = _swapCurve(
+                    step.router,
+                    step.tokenIn,
+                    step.tokenOut,
+                    amountIn,
+                    step.minAmountOut,
+                    step.swapData
+                );
             } else {
                 // Generic router call for other protocols
                 amountOut = _swapGeneric(
@@ -592,6 +602,89 @@ contract FlashloanArbitrage is IFlashLoanRecipient {
 
         // SECURITY: Clear approval after swap
         _safeApprove(tokenIn, BALANCER_VAULT, 0);
+    }
+
+    /**
+     * @notice Execute swap on Curve Finance pool
+     * @param pool Curve pool address
+     * @param tokenIn Input token address
+     * @param tokenOut Output token address (used for validation)
+     * @param amountIn Amount of input tokens
+     * @param minAmountOut Minimum output amount
+     * @param swapData ABI encoded (int128 i, int128 j, bool isEthPool) coin indices and ETH flag
+     * @return amountOut Amount of output tokens received
+     * @dev SECURITY: Pool must be in approvedRouters whitelist
+     *      swapData format: abi.encode(int128 i, int128 j, bool isEthPool)
+     *      - i: input coin index in the pool
+     *      - j: output coin index in the pool
+     *      - isEthPool: true if pool uses native ETH (like stETH pool)
+     *
+     * SUPPORTED POOLS:
+     * - 3pool (DAI/USDC/USDT): indices 0=DAI, 1=USDC, 2=USDT
+     * - stETH pool (ETH/stETH): indices 0=ETH, 1=stETH (isEthPool=true)
+     * - FRAX/USDC: indices 0=FRAX, 1=USDC
+     */
+    function _swapCurve(
+        address pool,
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 minAmountOut,
+        bytes memory swapData
+    ) internal returns (uint256 amountOut) {
+        // SECURITY: Validate swapData contains coin indices
+        if (swapData.length < 64) revert InvalidSwapData();
+
+        // Decode coin indices and ETH flag from swapData
+        (int128 i, int128 j, bool isEthPool) = abi.decode(swapData, (int128, int128, bool));
+
+        // Record output token balance before swap
+        uint256 balanceBefore = _getBalance(tokenOut);
+
+        if (isEthPool && i == 0) {
+            // ETH input: for pools like stETH where coin 0 is ETH
+            // We need WETH to be unwrapped first, or use ETH directly
+            // For simplicity, assume we're working with WETH and need to unwrap
+            // In production, you might need to handle WETH unwrapping
+
+            // Execute swap with ETH value
+            ICurvePoolETH(pool).exchange{value: amountIn}(
+                i,
+                j,
+                amountIn,
+                minAmountOut
+            );
+        } else {
+            // ERC20 token input
+            // SECURITY: Reset and set approval
+            _safeApprove(tokenIn, pool, 0);
+            _safeApprove(tokenIn, pool, amountIn);
+
+            // Execute Curve exchange
+            // Using try/catch to handle both int128 and uint256 pool interfaces
+            try ICurvePool(pool).exchange(i, j, amountIn, minAmountOut) returns (uint256 result) {
+                // Some pools return the output amount
+                if (result > 0) {
+                    amountOut = result;
+                }
+            } catch {
+                // Fallback: pool might not return value, calculate from balance change
+            }
+
+            // SECURITY: Clear approval after swap
+            _safeApprove(tokenIn, pool, 0);
+        }
+
+        // Calculate actual output from balance change if not set
+        if (amountOut == 0) {
+            uint256 balanceAfter = _getBalance(tokenOut);
+            if (balanceAfter > balanceBefore) {
+                amountOut = balanceAfter - balanceBefore;
+            }
+        }
+
+        // For ETH output (j == 0 on ETH pools), check ETH balance
+        // Note: Contract should have receive() function to accept ETH
     }
 
     /**

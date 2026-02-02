@@ -974,7 +974,187 @@ mod tokens {
     }
 }
 
+/// Curve pool configuration for swap routing
+/// Contains pool addresses and coin indices for known Curve pools
+#[allow(dead_code)]
+mod curve_pools {
+    use alloy::primitives::Address;
+
+    /// Curve pool info: (pool_address, coin_i_index, coin_j_index, is_eth_pool)
+    /// Indices are for the exchange(i, j, dx, min_dy) function
+    pub struct CurvePoolInfo {
+        pub pool: Address,
+        pub i: i128,  // Input coin index
+        pub j: i128,  // Output coin index
+        pub is_eth_pool: bool,  // True if pool uses native ETH
+    }
+
+    /// 3pool (DAI/USDC/USDT) - Main stablecoin pool
+    pub const CURVE_3POOL: &str = "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7";
+    /// 3pool coin indices: 0=DAI, 1=USDC, 2=USDT
+
+    /// stETH pool (ETH/stETH) - Liquid staking pool
+    pub const CURVE_STETH: &str = "0xDC24316b9AE028F1497c275EB9192a3Ea0f67022";
+    /// stETH pool coin indices: 0=ETH, 1=stETH
+
+    /// FRAX/USDC pool
+    pub const CURVE_FRAX_USDC: &str = "0xDcEF968d416a41Cdac0ED8702fAC8128A64241A2";
+    /// FRAX/USDC pool coin indices: 0=FRAX, 1=USDC
+
+    /// Tricrypto2 (USDT/WBTC/WETH)
+    pub const CURVE_TRICRYPTO: &str = "0xD51a44d3FaE010294C616388b506AcdA1bfAAE46";
+    /// Tricrypto coin indices: 0=USDT, 1=WBTC, 2=WETH
+
+    /// frxETH pool (ETH/frxETH)
+    pub const CURVE_FRXETH: &str = "0xa1F8A6807c402E4A15ef4EBa36528A3FED24E577";
+    /// frxETH pool coin indices: 0=ETH, 1=frxETH
+
+    /// rETH pool (ETH/rETH)
+    pub const CURVE_RETH: &str = "0x0f3159811670c117c372428D4E69AC32325e4D0F";
+    /// rETH pool coin indices: 0=ETH, 1=rETH
+
+    /// crvUSD/USDC pool
+    pub const CURVE_CRVUSD_USDC: &str = "0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E";
+    /// crvUSD/USDC coin indices: 0=crvUSD, 1=USDC
+
+    /// crvUSD/USDT pool
+    pub const CURVE_CRVUSD_USDT: &str = "0x390f3595bCa2Df7d23783dFd126427CCeb997BF4";
+    /// crvUSD/USDT coin indices: 0=crvUSD, 1=USDT
+
+    /// Get Curve pool info for a given pool address and token pair
+    /// Returns (pool_address, i, j, is_eth_pool) where i and j are coin indices
+    pub fn get_curve_pool_info(pool_address: Address, token_in: Address, token_out: Address) -> Option<CurvePoolInfo> {
+        use super::tokens;
+
+        let pool_str = format!("{:?}", pool_address).to_lowercase();
+        let token_in_str = format!("{:?}", token_in).to_lowercase();
+        let token_out_str = format!("{:?}", token_out).to_lowercase();
+
+        // Helper to check token match
+        let matches_token = |addr: &str, token: &str| -> bool {
+            addr.to_lowercase() == token.to_lowercase()
+        };
+
+        // 3pool: DAI(0), USDC(1), USDT(2)
+        if pool_str.contains(&CURVE_3POOL[2..].to_lowercase()) {
+            let dai = tokens::DAI.to_lowercase();
+            let usdc = tokens::USDC.to_lowercase();
+            let usdt = tokens::USDT.to_lowercase();
+
+            let i = if matches_token(&token_in_str, &dai) { 0 }
+                   else if matches_token(&token_in_str, &usdc) { 1 }
+                   else if matches_token(&token_in_str, &usdt) { 2 }
+                   else { return None; };
+
+            let j = if matches_token(&token_out_str, &dai) { 0 }
+                   else if matches_token(&token_out_str, &usdc) { 1 }
+                   else if matches_token(&token_out_str, &usdt) { 2 }
+                   else { return None; };
+
+            return Some(CurvePoolInfo {
+                pool: pool_address,
+                i,
+                j,
+                is_eth_pool: false,
+            });
+        }
+
+        // stETH pool: ETH(0), stETH(1)
+        if pool_str.contains(&CURVE_STETH[2..].to_lowercase()) {
+            let weth = tokens::WETH.to_lowercase();
+            let steth = tokens::STETH.to_lowercase();
+
+            // Note: WETH is treated as ETH for this pool
+            let i = if matches_token(&token_in_str, &weth) || token_in_str.contains("eth") { 0 }
+                   else if matches_token(&token_in_str, &steth) { 1 }
+                   else { return None; };
+
+            let j = if matches_token(&token_out_str, &weth) || token_out_str.contains("eth") { 0 }
+                   else if matches_token(&token_out_str, &steth) { 1 }
+                   else { return None; };
+
+            return Some(CurvePoolInfo {
+                pool: pool_address,
+                i,
+                j,
+                is_eth_pool: true,
+            });
+        }
+
+        // FRAX/USDC pool: FRAX(0), USDC(1)
+        if pool_str.contains(&CURVE_FRAX_USDC[2..].to_lowercase()) {
+            let frax = tokens::FRAX.to_lowercase();
+            let usdc = tokens::USDC.to_lowercase();
+
+            let i = if matches_token(&token_in_str, &frax) { 0 }
+                   else if matches_token(&token_in_str, &usdc) { 1 }
+                   else { return None; };
+
+            let j = if matches_token(&token_out_str, &frax) { 0 }
+                   else if matches_token(&token_out_str, &usdc) { 1 }
+                   else { return None; };
+
+            return Some(CurvePoolInfo {
+                pool: pool_address,
+                i,
+                j,
+                is_eth_pool: false,
+            });
+        }
+
+        // frxETH pool: ETH(0), frxETH(1)
+        if pool_str.contains(&CURVE_FRXETH[2..].to_lowercase()) {
+            let weth = tokens::WETH.to_lowercase();
+
+            let i = if matches_token(&token_in_str, &weth) || token_in_str.contains("eth") { 0 }
+                   else { 1 };
+
+            let j = if matches_token(&token_out_str, &weth) || token_out_str.contains("eth") { 0 }
+                   else { 1 };
+
+            return Some(CurvePoolInfo {
+                pool: pool_address,
+                i,
+                j,
+                is_eth_pool: true,
+            });
+        }
+
+        // rETH pool: ETH(0), rETH(1)
+        if pool_str.contains(&CURVE_RETH[2..].to_lowercase()) {
+            let weth = tokens::WETH.to_lowercase();
+
+            let i = if matches_token(&token_in_str, &weth) || token_in_str.contains("eth") { 0 }
+                   else { 1 };
+
+            let j = if matches_token(&token_out_str, &weth) || token_out_str.contains("eth") { 0 }
+                   else { 1 };
+
+            return Some(CurvePoolInfo {
+                pool: pool_address,
+                i,
+                j,
+                is_eth_pool: true,
+            });
+        }
+
+        // Default: try to infer from pool name in dex field
+        // For unknown pools, return None - they need to be added explicitly
+        None
+    }
+
+    /// Encode Curve swap data for the FlashloanArbitrage contract
+    /// Returns ABI encoded (int128 i, int128 j, bool isEthPool)
+    pub fn encode_curve_swap_data(i: i128, j: i128, is_eth_pool: bool) -> Vec<u8> {
+        use alloy::sol_types::SolValue;
+        // Encode as (int128, int128, bool)
+        // Note: Solidity uses int128, we encode as i128
+        (i, j, is_eth_pool).abi_encode()
+    }
+}
+
 /// Build swap steps for a simple two-leg arbitrage (buy on one DEX, sell on another)
+/// Supports UniswapV2, UniswapV3, Balancer, and Curve pools
 #[allow(dead_code)]
 fn build_arbitrage_swap_steps(
     buy_data: &DexPriceData,
@@ -984,51 +1164,109 @@ fn build_arbitrage_swap_steps(
     flash_loan_amount: U256,
     slippage_tolerance_bps: u64,  // in basis points (100 = 1%)
 ) -> Option<Vec<SwapStep>> {
-    // Get router addresses
-    let buy_router = dex_routers::get_router_address(buy_data.dex)?;
-    let sell_router = dex_routers::get_router_address(sell_data.dex)?;
-
     // Calculate minimum amounts with slippage protection
     // For buy step: we're buying token1 with token0
     // min_out = expected_out * (1 - slippage)
     let slippage_factor = 10000 - slippage_tolerance_bps;
 
-    // Step 1: Buy token1 with the flash-loaned token0
-    // Use 0 for amountIn to indicate "use all available"
-    let buy_step = SwapStep {
-        protocol: get_protocol_id(buy_data.dex),
-        router: buy_router,
-        token_in: token0,
-        token_out: token1,
-        swap_data: match buy_data.dex_type {
-            DexType::UniswapV3 { fee_tier } => {
-                // For V3, swap_data includes the fee tier
-                fee_tier.to_be_bytes().to_vec()
-            }
-            _ => Vec::new(),
-        },
-        amount_in: flash_loan_amount,
-        min_amount_out: U256::from(0), // Will be calculated by contract or we compute expected output
-    };
+    // Build buy step based on DEX type
+    let buy_step = build_swap_step(
+        buy_data,
+        token0,
+        token1,
+        flash_loan_amount,
+        U256::from(0), // Will be calculated by contract or we compute expected output
+    )?;
 
-    // Step 2: Sell token1 back to token0
-    // We need to end up with more token0 than we borrowed
-    let sell_step = SwapStep {
-        protocol: get_protocol_id(sell_data.dex),
-        router: sell_router,
-        token_in: token1,
-        token_out: token0,
-        swap_data: match sell_data.dex_type {
-            DexType::UniswapV3 { fee_tier } => {
-                fee_tier.to_be_bytes().to_vec()
-            }
-            _ => Vec::new(),
-        },
-        amount_in: U256::from(0), // Use all token1 from step 1
-        min_amount_out: flash_loan_amount * U256::from(slippage_factor) / U256::from(10000), // At least get back what we borrowed
-    };
+    // Build sell step based on DEX type
+    let sell_step = build_swap_step(
+        sell_data,
+        token1,
+        token0,
+        U256::from(0), // Use all token1 from step 1
+        flash_loan_amount * U256::from(slippage_factor) / U256::from(10000), // At least get back what we borrowed
+    )?;
 
     Some(vec![buy_step, sell_step])
+}
+
+/// Build a single swap step for a given DEX, handling protocol-specific details
+/// Supports UniswapV2, UniswapV3, Balancer, and Curve pools
+#[allow(dead_code)]
+fn build_swap_step(
+    dex_data: &DexPriceData,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    min_amount_out: U256,
+) -> Option<SwapStep> {
+    match dex_data.dex_type {
+        DexType::Curve => {
+            // For Curve pools, use the pool address directly (not a router)
+            // and encode the coin indices in swap_data
+            let curve_info = curve_pools::get_curve_pool_info(
+                dex_data.pool_address,
+                token_in,
+                token_out,
+            )?;
+
+            let swap_data = curve_pools::encode_curve_swap_data(
+                curve_info.i,
+                curve_info.j,
+                curve_info.is_eth_pool,
+            );
+
+            Some(SwapStep {
+                protocol: protocol::CURVE,
+                router: dex_data.pool_address, // For Curve, router is the pool address
+                token_in,
+                token_out,
+                swap_data,
+                amount_in,
+                min_amount_out,
+            })
+        }
+        DexType::UniswapV3 { fee_tier } => {
+            let router = dex_routers::get_router_address(dex_data.dex)?;
+            Some(SwapStep {
+                protocol: protocol::UNISWAP_V3,
+                router,
+                token_in,
+                token_out,
+                swap_data: fee_tier.to_be_bytes().to_vec(),
+                amount_in,
+                min_amount_out,
+            })
+        }
+        DexType::BalancerV2 => {
+            let router = dex_routers::get_router_address(dex_data.dex)?;
+            // For Balancer, swap_data should contain the pool ID
+            // The pool address can be used to derive the pool ID in some cases
+            // For now, we'll use an empty swap_data and let the contract handle it
+            // In production, you'd fetch the actual pool ID
+            Some(SwapStep {
+                protocol: protocol::BALANCER,
+                router,
+                token_in,
+                token_out,
+                swap_data: Vec::new(), // Pool ID would go here
+                amount_in,
+                min_amount_out,
+            })
+        }
+        DexType::UniswapV2 | DexType::PancakeSwap | DexType::Camelot => {
+            let router = dex_routers::get_router_address(dex_data.dex)?;
+            Some(SwapStep {
+                protocol: protocol::UNISWAP_V2,
+                router,
+                token_in,
+                token_out,
+                swap_data: Vec::new(),
+                amount_in,
+                min_amount_out,
+            })
+        }
+    }
 }
 
 /// Validation result for arbitrage opportunities
@@ -2568,13 +2806,20 @@ mod protocol {
 }
 
 /// Get protocol ID from DEX name
+/// Supports Curve pool names like "Curve-3pool", "Curve-steth", etc.
 #[allow(dead_code)]
 fn get_protocol_id(dex_name: &str) -> u8 {
-    match dex_name.to_lowercase().as_str() {
+    let name_lower = dex_name.to_lowercase();
+
+    // Check for Curve pools first (handles "Curve-3pool", "Curve-steth", etc.)
+    if name_lower.starts_with("curve") {
+        return protocol::CURVE;
+    }
+
+    match name_lower.as_str() {
         "univ2" | "uniswap" | "uniswapv2" | "sushi" | "sushiswap" | "shiba" | "shibaswap" | "frax" | "fraxswap" | "pancake" | "pancakeswap" => protocol::UNISWAP_V2,
         "univ3" | "uniswapv3" => protocol::UNISWAP_V3,
         "balancer" | "balancerv2" => protocol::BALANCER,
-        "curve" => protocol::CURVE,
         _ => protocol::UNISWAP_V2, // Default to UniV2 style
     }
 }
