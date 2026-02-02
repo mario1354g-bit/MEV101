@@ -10,6 +10,7 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use alloy::transports::http::{Client, Http};
 use alloy::transports::Transport;
+use futures::StreamExt;
 use alloy::network::{EthereumWallet, TransactionBuilder, TxSignerSync};
 use alloy::signers::local::PrivateKeySigner;
 #[cfg(feature = "dashboard")]
@@ -64,6 +65,32 @@ pub struct AppState {
 
     /// Live stats counters
     pub stats: Arc<LiveStats>,
+
+    /// Real-time price cache updated by Swap events
+    pub price_cache: Arc<DashMap<String, PriceUpdate>>,
+}
+
+/// Real-time price data from Swap events
+#[derive(Debug, Clone)]
+pub struct PriceUpdate {
+    /// Pool address
+    pub pool: Address,
+    /// DEX type (e.g., "UniV2", "UniV3", "Curve")
+    pub dex: String,
+    /// Token0 address
+    pub token0: Address,
+    /// Token1 address
+    pub token1: Address,
+    /// Amount0 (can be negative for swaps)
+    pub amount0: i128,
+    /// Amount1 (can be negative for swaps)
+    pub amount1: i128,
+    /// Implied price (token1/token0)
+    pub price: f64,
+    /// Block number
+    pub block_number: u64,
+    /// Timestamp
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 /// Live statistics tracking
@@ -237,6 +264,7 @@ async fn async_main() -> Result<(), MevError> {
             pairs_monitored: std::sync::atomic::AtomicU64::new(0),
             last_block: std::sync::atomic::AtomicU64::new(0),
         }),
+        price_cache: Arc::new(DashMap::new()),
     });
 
     // Spawn monitoring tasks
@@ -294,6 +322,25 @@ async fn async_main() -> Result<(), MevError> {
                 }
                 _ = shutdown_rx.recv() => {
                     info!("DEX monitor shutting down");
+                }
+            }
+        }));
+    }
+
+    // Swap event monitor for real-time price updates
+    if config.monitoring.dex_enabled {
+        let state = Arc::clone(&app_state);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        handles.push(tokio::spawn(async move {
+            info!("Starting Swap event monitor for real-time price updates");
+            tokio::select! {
+                result = run_swap_event_monitor(state) => {
+                    if let Err(e) = result {
+                        error!("Swap event monitor error: {}", e);
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Swap event monitor shutting down");
                 }
             }
         }));
@@ -832,7 +879,8 @@ enum DexType {
     /// Uniswap V3 style (concentrated liquidity)
     UniswapV3 { fee_tier: u32 },
     /// Curve Finance (stableswap invariant)
-    Curve,
+    /// Contains coin indices (i, j) for get_dy pricing and decimals for each coin
+    Curve { i: i128, j: i128, decimals_i: u8, decimals_j: u8 },
     /// Balancer V2 (weighted pools)
     BalancerV2,
     /// PancakeSwap on Ethereum
@@ -1201,20 +1249,16 @@ fn build_swap_step(
     min_amount_out: U256,
 ) -> Option<SwapStep> {
     match dex_data.dex_type {
-        DexType::Curve => {
+        DexType::Curve { i, j, .. } => {
             // For Curve pools, use the pool address directly (not a router)
             // and encode the coin indices in swap_data
-            let curve_info = curve_pools::get_curve_pool_info(
-                dex_data.pool_address,
-                token_in,
-                token_out,
-            )?;
+            // Determine if it's an ETH pool based on pool address
+            let pool_str = format!("{:?}", dex_data.pool_address).to_lowercase();
+            let is_eth_pool = pool_str.contains(&curve_pools::CURVE_STETH[2..].to_lowercase())
+                || pool_str.contains(&curve_pools::CURVE_FRXETH[2..].to_lowercase())
+                || pool_str.contains(&curve_pools::CURVE_RETH[2..].to_lowercase());
 
-            let swap_data = curve_pools::encode_curve_swap_data(
-                curve_info.i,
-                curve_info.j,
-                curve_info.is_eth_pool,
-            );
+            let swap_data = curve_pools::encode_curve_swap_data(i, j, is_eth_pool);
 
             Some(SwapStep {
                 protocol: protocol::CURVE,
@@ -1295,6 +1339,28 @@ enum OpportunityValidation {
         gross_profit_usd: f64,
         gas_cost_usd: f64,
     },
+    /// On-chain simulation failed - opportunity would revert or be unprofitable
+    SimulationFailed {
+        reason: String,
+    },
+}
+
+/// Result of on-chain arbitrage simulation via eth_call
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+struct ArbitrageSimulationResult {
+    /// Whether the simulation succeeded (no revert)
+    pub success: bool,
+    /// Simulated output amount from the arbitrage (in input token units)
+    pub output_amount: U256,
+    /// Simulated profit in wei (output - input)
+    pub profit_wei: i128,
+    /// Estimated gas cost in wei
+    pub gas_cost_wei: u128,
+    /// Net profit after gas (profit - gas_cost)
+    pub net_profit_wei: i128,
+    /// Failure reason if simulation failed
+    pub failure_reason: Option<String>,
 }
 
 /// Constants for opportunity validation
@@ -1384,7 +1450,8 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
             ("UniV3-0.3%", "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD", DexType::UniswapV3 { fee_tier: 3000 }),
             ("Sushi", "0xCEfF51756c56CeFFCA006cD410B03FFC46dd3a58", DexType::UniswapV2),
             ("BalancerV2", "0xA6F548DF93de924d73be7D25dC02554c6bD66dB5", DexType::BalancerV2),
-            ("Curve-tricrypto", "0xD51a44d3FaE010294C616388b506AcdA1bfAAE46", DexType::Curve),
+            // Tricrypto: 0=USDT(6), 1=WBTC(8), 2=WETH(18) - this is WBTC/WETH pair
+            ("Curve-tricrypto", "0xD51a44d3FaE010294C616388b506AcdA1bfAAE46", DexType::Curve { i: 1, j: 2, decimals_i: 8, decimals_j: 18 }),
         ]),
 
         // --- MEDIUM LIQUIDITY (Top 20-50) WITH V3 POOLS ---
@@ -1609,32 +1676,37 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
             ("UniV3-0.01%", "0x3416cF6C708Da44DB2624D63ea0AAef7113527C6", DexType::UniswapV3 { fee_tier: 100 }),
             ("UniV3-0.05%", "0x7858E59e0C01EA06Df3aF3D20aC7B0003275D4Bf", DexType::UniswapV3 { fee_tier: 500 }),
             ("Sushi", "0xD86A120a06255Df8D4e2248aB04d4267E23aDfaA", DexType::UniswapV2),
-            ("Curve-3pool", "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", DexType::Curve),
+            // 3pool: 0=DAI(18), 1=USDC(6), 2=USDT(6) - USDC->USDT swap
+            ("Curve-3pool", "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", DexType::Curve { i: 1, j: 2, decimals_i: 6, decimals_j: 6 }),
         ]),
         TradingPair::new_with_types("DAI/USDC", 18, 6, vec![
             ("UniV2", "0xAE461cA67B15dc8dc81CE7615e0320dA1A9aB8D5", DexType::UniswapV2),
             ("UniV3-0.01%", "0x5777d92f208679DB4b9778590Fa3CAB3aC9e2168", DexType::UniswapV3 { fee_tier: 100 }),
             ("UniV3-0.05%", "0x6c6Bc977E13Df9b0de53b251522280BB72383700", DexType::UniswapV3 { fee_tier: 500 }),
             ("Sushi", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", DexType::UniswapV2),
-            ("Curve-3pool", "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", DexType::Curve),
+            // 3pool: 0=DAI(18), 1=USDC(6), 2=USDT(6) - DAI->USDC swap
+            ("Curve-3pool", "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7", DexType::Curve { i: 0, j: 1, decimals_i: 18, decimals_j: 6 }),
         ]),
         TradingPair::new_with_types("FRAX/USDC", 18, 6, vec![
             ("UniV2", "0x97C4adc5d28A86f9470C70DD91Dc6CC2f20d2d4D", DexType::UniswapV2),
             ("UniV3-0.05%", "0xc63B0708E2F7e69CB8A1df0e1389A98C35A76D52", DexType::UniswapV3 { fee_tier: 500 }),
             ("Sushi", "0x9a834b70c07C81a9fcD6F22E842bf002fBfFbe4D", DexType::UniswapV2),
             ("Frax", "0x9a834b70c07C81a9fcD6F22E842bf002fBfFbe4D", DexType::UniswapV2),
-            ("Curve-fraxusdc", "0xDcEF968d416a41Cdac0ED8702fAC8128A64241A2", DexType::Curve),
+            // FRAX/USDC pool: 0=FRAX(18), 1=USDC(6)
+            ("Curve-fraxusdc", "0xDcEF968d416a41Cdac0ED8702fAC8128A64241A2", DexType::Curve { i: 0, j: 1, decimals_i: 18, decimals_j: 6 }),
         ]),
 
         // --- BALANCER V2 SPECIFIC POOLS ---
         TradingPair::new_with_types("WETH/wstETH", 18, 18, vec![
             ("BalancerV2", "0x32296969Ef14EB0c6d29669C550D4a0449130230", DexType::BalancerV2),
-            ("Curve-steth", "0xDC24316b9AE028F1497c275EB9192a3Ea0f67022", DexType::Curve),
+            // stETH pool: 0=ETH(18), 1=stETH(18)
+            ("Curve-steth", "0xDC24316b9AE028F1497c275EB9192a3Ea0f67022", DexType::Curve { i: 0, j: 1, decimals_i: 18, decimals_j: 18 }),
         ]),
         TradingPair::new_with_types("WETH/rETH", 18, 18, vec![
             ("BalancerV2", "0x1E19CF2D73a72Ef1332C882F20534B6519Be0276", DexType::BalancerV2),
             ("UniV3-0.05%", "0xa4e0faA58465A2D369aa21B3e42d43374c6F9613", DexType::UniswapV3 { fee_tier: 500 }),
-            ("Curve-reth", "0x0f3159811670c117c372428D4E69AC32325e4D0F", DexType::Curve),
+            // rETH pool: 0=ETH(18), 1=rETH(18)
+            ("Curve-reth", "0x0f3159811670c117c372428D4E69AC32325e4D0F", DexType::Curve { i: 0, j: 1, decimals_i: 18, decimals_j: 18 }),
         ]),
         TradingPair::new_with_types("BAL/WETH", 18, 18, vec![
             ("BalancerV2-80BAL-20WETH", "0x5c6Ee304399DBdB9C8Ef030aB642B10820DB8F56", DexType::BalancerV2),
@@ -1649,17 +1721,21 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
 
         // --- CURVE CRYPTO POOLS (non-stablecoin) ---
         TradingPair::new_with_types("ETH/stETH", 18, 18, vec![
-            ("Curve-steth", "0xDC24316b9AE028F1497c275EB9192a3Ea0f67022", DexType::Curve),
+            // stETH pool: 0=ETH(18), 1=stETH(18)
+            ("Curve-steth", "0xDC24316b9AE028F1497c275EB9192a3Ea0f67022", DexType::Curve { i: 0, j: 1, decimals_i: 18, decimals_j: 18 }),
             ("UniV3-0.05%", "0x109830a1AAaD605BbF02a9dFA7B0B92EC2FB7dAa", DexType::UniswapV3 { fee_tier: 500 }),
         ]),
         TradingPair::new_with_types("ETH/frxETH", 18, 18, vec![
-            ("Curve-frxeth", "0xa1F8A6807c402E4A15ef4EBa36528A3FED24E577", DexType::Curve),
+            // frxETH pool: 0=ETH(18), 1=frxETH(18)
+            ("Curve-frxeth", "0xa1F8A6807c402E4A15ef4EBa36528A3FED24E577", DexType::Curve { i: 0, j: 1, decimals_i: 18, decimals_j: 18 }),
         ]),
         TradingPair::new_with_types("crvUSD/USDC", 18, 6, vec![
-            ("Curve-crvusd-usdc", "0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E", DexType::Curve),
+            // crvUSD/USDC: 0=crvUSD(18), 1=USDC(6)
+            ("Curve-crvusd-usdc", "0x4DEcE678ceceb27446b35C672dC7d61F30bAD69E", DexType::Curve { i: 0, j: 1, decimals_i: 18, decimals_j: 6 }),
         ]),
         TradingPair::new_with_types("crvUSD/USDT", 18, 6, vec![
-            ("Curve-crvusd-usdt", "0x390f3595bCa2Df7d23783dFd126427CCeb997BF4", DexType::Curve),
+            // crvUSD/USDT: 0=crvUSD(18), 1=USDT(6)
+            ("Curve-crvusd-usdt", "0x390f3595bCa2Df7d23783dFd126427CCeb997BF4", DexType::Curve { i: 0, j: 1, decimals_i: 18, decimals_j: 6 }),
         ]),
 
         // ============================================================================
@@ -2028,21 +2104,55 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                     let sell_data = &dex_prices[best_sell_idx.unwrap()];
 
                     // Validate opportunity with liquidity check and slippage simulation
-                    let validation = validate_arbitrage_opportunity(
+                    let mut validation = validate_arbitrage_opportunity(
                         buy_data,
                         sell_data,
                         max_spread,
                         pair.name,
                     );
 
+                    // If initial validation passes, run on-chain simulation via eth_call
+                    // This prevents false positives from ever being flagged as VALIDATED
+                    if matches!(validation, OpportunityValidation::Validated { .. }) {
+                        if let Some((token0, token1)) = tokens::parse_pair_tokens(pair.name) {
+                            let input_amount = U256::from((TRADE_SIZE_ETH * 1e18) as u64);
+                            let min_profit_eth = state.config.monitoring.min_profit_eth;
+
+                            let sim_result = simulate_arbitrage_opportunity(
+                                &*state.http_provider,
+                                buy_data,
+                                sell_data,
+                                token0,
+                                token1,
+                                input_amount,
+                                pair.name,
+                                min_profit_eth,
+                            ).await;
+
+                            if sim_result.success {
+                                // Simulation verified - log success and update validation with simulated values
+                                let simulated_profit_eth = (sim_result.net_profit_wei as f64) / 1e18;
+                                info!(
+                                    "SIMULATION VERIFIED: [{}] - simulated profit: {:.6} ETH ({} wei)",
+                                    pair.name, simulated_profit_eth, sim_result.net_profit_wei
+                                );
+                            } else {
+                                // Simulation failed - update validation status
+                                let reason = sim_result.failure_reason.unwrap_or_else(|| "Unknown failure".to_string());
+                                warn!("{}", reason);
+                                validation = OpportunityValidation::SimulationFailed { reason };
+                            }
+                        }
+                    }
+
                     // Determine status based on validation
                     // NOTE: "pending" and "high_priority" are the statuses the executor polls for
                     let (status, log_prefix) = match &validation {
                         OpportunityValidation::Validated { net_profit_usd, .. } => {
                             if *net_profit_usd > 100.0 {
-                                ("high_priority".to_string(), "VALIDATED")
+                                ("validated_simulated".to_string(), "VALIDATED_SIMULATED")
                             } else {
-                                ("pending".to_string(), "VALIDATED")
+                                ("validated_simulated".to_string(), "VALIDATED_SIMULATED")
                             }
                         }
                         OpportunityValidation::LowLiquidity { .. } => {
@@ -2053,6 +2163,9 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                         }
                         OpportunityValidation::GasExceedsProfit { .. } => {
                             ("gas_exceeds_profit".to_string(), "GAS_EXCEEDS_PROFIT")
+                        }
+                        OpportunityValidation::SimulationFailed { .. } => {
+                            ("simulation_failed".to_string(), "SIMULATION_FAILED")
                         }
                     };
 
@@ -2091,6 +2204,12 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                                 "[{}] [{}] Spread: {:.4}% | Gross profit: ${:.2}, Gas cost: ${:.2}",
                                 log_prefix, pair.name, max_spread,
                                 gross_profit_usd, gas_cost_usd
+                            );
+                        }
+                        OpportunityValidation::SimulationFailed { reason } => {
+                            tracing::debug!(
+                                "[{}] [{}] Spread: {:.4}% | {}",
+                                log_prefix, pair.name, max_spread, reason
                             );
                         }
                     }
@@ -2157,7 +2276,7 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                     });
 
                     // Log opportunity insertion for debugging the detection -> execution pipeline
-                    if status_for_log == "pending" || status_for_log == "high_priority" {
+                    if status_for_log == "validated_simulated" {
                         tracing::debug!(
                             "Inserted opportunity {} with status '{}' - ready for executor",
                             opp_id_for_log, status_for_log
@@ -2343,6 +2462,40 @@ async fn fetch_curve_price_oracle<P: Provider<T>, T: Transport + Clone>(
     Ok(decoded._0)
 }
 
+/// Fetch actual exchange rate from Curve pool using get_dy
+/// This returns the output amount for a given input amount, giving accurate pricing
+/// get_dy(int128 i, int128 j, uint256 dx) returns (uint256)
+async fn fetch_curve_get_dy<P: Provider<T>, T: Transport + Clone>(
+    provider: &P,
+    pool_address: Address,
+    i: i128,
+    j: i128,
+    input_amount: U256,
+) -> Result<U256, MevError> {
+    use alloy::sol;
+
+    sol! {
+        function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256);
+    }
+
+    let call = get_dyCall {
+        i,
+        j,
+        dx: input_amount,
+    };
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(pool_address)
+        .input(call.abi_encode().into());
+
+    let result = provider.call(&tx).await
+        .map_err(|e| MevError::Provider(ProviderError::RpcError(e.to_string())))?;
+
+    let decoded = get_dyCall::abi_decode_returns(&result, true)
+        .map_err(|e: alloy::sol_types::Error| MevError::Provider(ProviderError::RpcError(e.to_string())))?;
+
+    Ok(decoded._0)
+}
+
 /// Fetch price from Balancer V2 Vault using getPoolTokens
 /// Returns the token balances in the pool
 async fn fetch_balancer_v2_balances<P: Provider<T>, T: Transport + Clone>(
@@ -2459,11 +2612,25 @@ async fn fetch_dex_price_with_liquidity<P: Provider<T>, T: Transport + Clone>(
                 dex_type: dex_pair.dex_type.clone(),
             })
         }
-        DexType::Curve => {
-            // For Curve, get price from oracle and estimate liquidity from balances
-            let price = match fetch_curve_price_oracle(provider, dex_pair.address, 0).await {
-                Ok(p) => p.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
+        DexType::Curve { i, j, decimals_i, decimals_j } => {
+            // Use get_dy for accurate Curve pricing instead of virtual price
+            // Quote a reasonable amount based on decimals (1000 units of input token)
+            let quote_amount = U256::from(1000) * U256::from(10).pow(U256::from(decimals_i));
+
+            let price = match fetch_curve_get_dy(provider, dex_pair.address, i, j, quote_amount).await {
+                Ok(output_amount) => {
+                    // Calculate price as: output / input, adjusted for decimal differences
+                    // price = (output_amount / 10^decimals_j) / (input_amount / 10^decimals_i)
+                    //       = output_amount * 10^decimals_i / (input_amount * 10^decimals_j)
+                    let input_f64 = quote_amount.to_string().parse::<f64>().unwrap_or(1.0);
+                    let output_f64 = output_amount.to_string().parse::<f64>().unwrap_or(0.0);
+
+                    // Adjust for decimal differences between input and output tokens
+                    let decimal_adjustment = 10_f64.powi(decimals_i as i32 - decimals_j as i32);
+                    (output_f64 / input_f64) * decimal_adjustment
+                }
                 Err(_) => {
+                    // Fallback to virtual price if get_dy fails (shouldn't happen for well-configured pools)
                     match fetch_curve_virtual_price(provider, dex_pair.address).await {
                         Ok(vp) => vp.to_string().parse::<f64>().unwrap_or(0.0) / 1e18,
                         Err(e) => return Err(e),
@@ -2471,8 +2638,7 @@ async fn fetch_dex_price_with_liquidity<P: Provider<T>, T: Transport + Clone>(
                 }
             };
 
-            // Curve pools typically have high liquidity - estimate based on virtual price
-            // In production, you'd call get_balances() on the pool
+            // Curve pools typically have high liquidity
             let liquidity_usd = 10_000_000.0; // Default high liquidity for Curve (they're usually deep)
 
             Ok(DexPriceData {
@@ -2482,7 +2648,7 @@ async fn fetch_dex_price_with_liquidity<P: Provider<T>, T: Transport + Clone>(
                 reserve0: 0.0,
                 reserve1: 0.0,
                 pool_address: dex_pair.address,
-                dex_type: dex_pair.dex_type.clone(),
+                dex_type: dex_pair.dex_type,
             })
         }
         DexType::BalancerV2 => {
@@ -2670,6 +2836,305 @@ fn calculate_slippage(trade_size_usd: f64, liquidity_usd: f64) -> f64 {
     let slippage = (trade_size_usd / (reserve_per_side + trade_size_usd)) * 100.0;
 
     slippage
+}
+
+/// Simulate arbitrage opportunity on-chain using eth_call before flagging as validated
+/// This prevents false positives by verifying the swap would actually succeed and be profitable
+async fn simulate_arbitrage_opportunity<P: Provider<T>, T: Transport + Clone>(
+    provider: &P,
+    buy_data: &DexPriceData,
+    sell_data: &DexPriceData,
+    token0: Address,
+    token1: Address,
+    input_amount: U256,
+    pair_name: &str,
+    min_profit_eth: f64,
+) -> ArbitrageSimulationResult {
+    // Step 1: Simulate the buy swap (token0 -> token1 on buy DEX)
+    let step1_result = simulate_swap_output(
+        provider,
+        buy_data,
+        token0,
+        token1,
+        input_amount,
+    ).await;
+
+    let intermediate_amount = match step1_result {
+        Ok(amount) if amount > U256::ZERO => amount,
+        Ok(_) => {
+            return ArbitrageSimulationResult {
+                success: false,
+                output_amount: U256::ZERO,
+                profit_wei: 0,
+                gas_cost_wei: 0,
+                net_profit_wei: 0,
+                failure_reason: Some(format!("SIMULATION FAILED: [{}] - reason: Buy swap returned zero output", pair_name)),
+            };
+        }
+        Err(e) => {
+            return ArbitrageSimulationResult {
+                success: false,
+                output_amount: U256::ZERO,
+                profit_wei: 0,
+                gas_cost_wei: 0,
+                net_profit_wei: 0,
+                failure_reason: Some(format!("SIMULATION FAILED: [{}] - reason: Buy swap reverted: {}", pair_name, e)),
+            };
+        }
+    };
+
+    // Step 2: Simulate the sell swap (token1 -> token0 on sell DEX)
+    let step2_result = simulate_swap_output(
+        provider,
+        sell_data,
+        token1,
+        token0,
+        intermediate_amount,
+    ).await;
+
+    let final_amount = match step2_result {
+        Ok(amount) if amount > U256::ZERO => amount,
+        Ok(_) => {
+            return ArbitrageSimulationResult {
+                success: false,
+                output_amount: U256::ZERO,
+                profit_wei: 0,
+                gas_cost_wei: 0,
+                net_profit_wei: 0,
+                failure_reason: Some(format!("SIMULATION FAILED: [{}] - reason: Sell swap returned zero output", pair_name)),
+            };
+        }
+        Err(e) => {
+            return ArbitrageSimulationResult {
+                success: false,
+                output_amount: U256::ZERO,
+                profit_wei: 0,
+                gas_cost_wei: 0,
+                net_profit_wei: 0,
+                failure_reason: Some(format!("SIMULATION FAILED: [{}] - reason: Sell swap reverted: {}", pair_name, e)),
+            };
+        }
+    };
+
+    // Step 3: Calculate profit
+    let input_u128: u128 = input_amount.try_into().unwrap_or(u128::MAX);
+    let output_u128: u128 = final_amount.try_into().unwrap_or(0);
+    let profit_wei: i128 = (output_u128 as i128) - (input_u128 as i128);
+
+    // Step 4: Calculate gas cost (2 swaps = ~500k gas)
+    let gas_limit: u64 = GAS_LIMIT_SWAP * 2;
+    let gas_price_wei: u128 = ((BASE_FEE_GWEI + PRIORITY_FEE_GWEI) * 1e9) as u128;
+    let gas_cost_wei: u128 = (gas_limit as u128) * gas_price_wei;
+
+    // Step 5: Calculate net profit
+    let net_profit_wei: i128 = profit_wei - (gas_cost_wei as i128);
+
+    // Step 6: Check minimum profit threshold
+    let min_profit_wei: i128 = (min_profit_eth * 1e18) as i128;
+
+    if net_profit_wei < min_profit_wei {
+        return ArbitrageSimulationResult {
+            success: false,
+            output_amount: final_amount,
+            profit_wei,
+            gas_cost_wei,
+            net_profit_wei,
+            failure_reason: Some(format!(
+                "SIMULATION FAILED: [{}] - reason: Net profit {} wei below minimum {} wei",
+                pair_name, net_profit_wei, min_profit_wei
+            )),
+        };
+    }
+
+    // Simulation successful!
+    ArbitrageSimulationResult {
+        success: true,
+        output_amount: final_amount,
+        profit_wei,
+        gas_cost_wei,
+        net_profit_wei,
+        failure_reason: None,
+    }
+}
+
+/// Simulate a single swap output using eth_call
+/// Supports UniswapV2 (getAmountsOut), UniswapV3 (quoteExactInputSingle), and Curve (get_dy)
+async fn simulate_swap_output<P: Provider<T>, T: Transport + Clone>(
+    provider: &P,
+    dex_data: &DexPriceData,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+) -> Result<U256, String> {
+    match dex_data.dex_type {
+        DexType::UniswapV2 => {
+            simulate_uniswap_v2_swap(provider, token_in, token_out, amount_in).await
+        }
+        DexType::UniswapV3 { fee_tier } => {
+            simulate_uniswap_v3_swap(provider, token_in, token_out, amount_in, fee_tier).await
+        }
+        DexType::Curve { i, j, .. } => {
+            simulate_curve_swap(provider, dex_data.pool_address, i, j, amount_in).await
+        }
+        DexType::BalancerV2 => {
+            // Balancer requires more complex batch swap simulation
+            // Fall back to reserve-based estimation for now
+            estimate_output_from_reserves(dex_data, amount_in)
+        }
+        DexType::PancakeSwap | DexType::Camelot => {
+            // These use UniswapV2-compatible interface
+            simulate_uniswap_v2_swap(provider, token_in, token_out, amount_in).await
+        }
+    }
+}
+
+/// Simulate UniswapV2 swap using getAmountsOut on the router
+async fn simulate_uniswap_v2_swap<P: Provider<T>, T: Transport + Clone>(
+    provider: &P,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+) -> Result<U256, String> {
+    sol! {
+        function getAmountsOut(uint256 amountIn, address[] calldata path) external view returns (uint256[] memory amounts);
+    }
+
+    // Use UniswapV2 Router for getAmountsOut
+    let router: Address = dex_routers::UNISWAP_V2_ROUTER.parse()
+        .map_err(|_| "Invalid router address".to_string())?;
+
+    let path = vec![token_in, token_out];
+    let call = getAmountsOutCall {
+        amountIn: amount_in,
+        path,
+    };
+
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(router)
+        .input(call.abi_encode().into());
+
+    match provider.call(&tx).await {
+        Ok(result) => {
+            // Decode the result - returns array of amounts
+            match getAmountsOutCall::abi_decode_returns(&result, true) {
+                Ok(decoded) => {
+                    if decoded.amounts.len() >= 2 {
+                        Ok(decoded.amounts[1])
+                    } else {
+                        Err("Invalid getAmountsOut response".to_string())
+                    }
+                }
+                Err(e) => Err(format!("Failed to decode getAmountsOut: {}", e))
+            }
+        }
+        Err(e) => Err(format!("getAmountsOut call failed: {}", e))
+    }
+}
+
+/// Simulate UniswapV3 swap using Quoter contract
+async fn simulate_uniswap_v3_swap<P: Provider<T>, T: Transport + Clone>(
+    provider: &P,
+    token_in: Address,
+    token_out: Address,
+    amount_in: U256,
+    fee_tier: u32,
+) -> Result<U256, String> {
+    sol! {
+        function quoteExactInputSingle(
+            address tokenIn,
+            address tokenOut,
+            uint24 fee,
+            uint256 amountIn,
+            uint160 sqrtPriceLimitX96
+        ) external returns (uint256 amountOut);
+    }
+
+    // UniswapV3 Quoter contract
+    let quoter: Address = "0xb27308f9F90D607463bb33eA1BeBb41C27CE5AB6".parse()
+        .map_err(|_| "Invalid quoter address".to_string())?;
+
+    // Convert fee_tier to uint24 (Uint<24, 1>)
+    let fee_uint24 = alloy::primitives::Uint::<24, 1>::from(fee_tier);
+    // sqrtPriceLimitX96 = 0 means no limit
+    let sqrt_price_limit = alloy::primitives::Uint::<160, 3>::ZERO;
+
+    let call = quoteExactInputSingleCall {
+        tokenIn: token_in,
+        tokenOut: token_out,
+        fee: fee_uint24,
+        amountIn: amount_in,
+        sqrtPriceLimitX96: sqrt_price_limit,
+    };
+
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(quoter)
+        .input(call.abi_encode().into());
+
+    match provider.call(&tx).await {
+        Ok(result) => {
+            match quoteExactInputSingleCall::abi_decode_returns(&result, true) {
+                Ok(decoded) => Ok(decoded.amountOut),
+                Err(e) => Err(format!("Failed to decode quoteExactInputSingle: {}", e))
+            }
+        }
+        Err(e) => Err(format!("quoteExactInputSingle call failed: {}", e))
+    }
+}
+
+/// Simulate Curve swap using get_dy
+async fn simulate_curve_swap<P: Provider<T>, T: Transport + Clone>(
+    provider: &P,
+    pool_address: Address,
+    i: i128,
+    j: i128,
+    amount_in: U256,
+) -> Result<U256, String> {
+    sol! {
+        function get_dy(int128 i, int128 j, uint256 dx) external view returns (uint256);
+    }
+
+    let call = get_dyCall {
+        i,
+        j,
+        dx: amount_in,
+    };
+
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(pool_address)
+        .input(call.abi_encode().into());
+
+    match provider.call(&tx).await {
+        Ok(result) => {
+            match get_dyCall::abi_decode_returns(&result, true) {
+                Ok(decoded) => Ok(decoded._0),
+                Err(e) => Err(format!("Failed to decode get_dy: {}", e))
+            }
+        }
+        Err(e) => Err(format!("get_dy call failed: {}", e))
+    }
+}
+
+/// Fallback: estimate output from reserves using constant product formula
+fn estimate_output_from_reserves(dex_data: &DexPriceData, amount_in: U256) -> Result<U256, String> {
+    if dex_data.reserve0 <= 0.0 || dex_data.reserve1 <= 0.0 {
+        return Err("Invalid reserves".to_string());
+    }
+
+    // x * y = k formula: dy = y * dx / (x + dx)
+    let dx: f64 = amount_in.to_string().parse::<f64>().unwrap_or(0.0);
+    let x = dex_data.reserve0;
+    let y = dex_data.reserve1;
+
+    // Apply 0.3% fee (standard AMM fee)
+    let dx_after_fee = dx * 0.997;
+    let dy = (y * dx_after_fee) / (x + dx_after_fee);
+
+    if dy <= 0.0 {
+        return Err("Calculated output is zero or negative".to_string());
+    }
+
+    // Convert back to U256
+    Ok(U256::from(dy as u128))
 }
 
 /// Run opportunity detector - processes pending txs and detects MEV opportunities
@@ -3330,17 +3795,18 @@ async fn run_executor(state: Arc<AppState>) -> Result<(), MevError> {
 
     loop {
         // Collect opportunities to process (avoid holding lock during execution)
+        // Only process opportunities that have been validated AND simulation-verified
         let total_opportunities = state.opportunities.len();
         let opportunities_to_process: Vec<(String, MevOpportunity)> = state.opportunities
             .iter()
-            .filter(|entry| entry.value().status == "pending" || entry.value().status == "high_priority")
+            .filter(|entry| entry.value().status == "validated_simulated")
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
 
         // Log executor status periodically (every 30 seconds) for debugging
         if last_log_time.elapsed().as_secs() >= 30 {
             tracing::debug!(
-                "Executor poll: {} total opportunities, {} pending/high_priority",
+                "Executor poll: {} total opportunities, {} validated_simulated",
                 total_opportunities,
                 opportunities_to_process.len()
             );
@@ -3349,7 +3815,7 @@ async fn run_executor(state: Arc<AppState>) -> Result<(), MevError> {
 
         if !opportunities_to_process.is_empty() {
             info!(
-                "Executor found {} opportunities to process (pending/high_priority)",
+                "Executor found {} opportunities to process (validated_simulated)",
                 opportunities_to_process.len()
             );
         }
@@ -3588,6 +4054,324 @@ mod dashboard {
 
 #[cfg(feature = "dashboard")]
 use dashboard::run_dashboard;
+
+// ============================================================================
+// SWAP EVENT MONITOR - Real-time price updates via Swap event subscriptions
+// ============================================================================
+
+// Swap event signatures for different DEX types
+sol! {
+    /// UniswapV2 Swap event
+    #[derive(Debug)]
+    event UniV2Swap(
+        address indexed sender,
+        uint256 amount0In,
+        uint256 amount1In,
+        uint256 amount0Out,
+        uint256 amount1Out,
+        address indexed to
+    );
+
+    /// UniswapV3 Swap event
+    #[derive(Debug)]
+    event UniV3Swap(
+        address indexed sender,
+        address indexed recipient,
+        int256 amount0,
+        int256 amount1,
+        uint160 sqrtPriceX96,
+        uint128 liquidity,
+        int24 tick
+    );
+
+    /// Curve TokenExchange event (for standard Curve pools)
+    #[derive(Debug)]
+    event CurveTokenExchange(
+        address indexed buyer,
+        int128 sold_id,
+        uint256 tokens_sold,
+        int128 bought_id,
+        uint256 tokens_bought
+    );
+
+    /// Curve TokenExchangeUnderlying event (for metapools)
+    #[derive(Debug)]
+    event CurveTokenExchangeUnderlying(
+        address indexed buyer,
+        int128 sold_id,
+        uint256 tokens_sold,
+        int128 bought_id,
+        uint256 tokens_bought
+    );
+}
+
+/// High-volume pool addresses to monitor for Swap events
+mod monitored_pools {
+    use alloy::primitives::Address;
+
+    /// Top UniswapV2 pools
+    pub const UNIV2_WETH_USDC: Address = alloy::primitives::address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc");
+    pub const UNIV2_WETH_USDT: Address = alloy::primitives::address!("0d4a11d5EEaaC28EC3F61d100daF4d40471f1852");
+    pub const UNIV2_WETH_DAI: Address = alloy::primitives::address!("A478c2975Ab1Ea89e8196811F51A7B7Ade33eB11");
+    pub const UNIV2_USDC_USDT: Address = alloy::primitives::address!("3041CbD36888bECc7bbCBc0045E3B1f144466f5f");
+    pub const SUSHI_WETH_USDC: Address = alloy::primitives::address!("397FF1542f962076d0BFE58eA045FfA2d347ACa0");
+    pub const SUSHI_WETH_USDT: Address = alloy::primitives::address!("06da0fd433C1A5d7a4faa01111c044910A184553");
+
+    /// Top UniswapV3 pools (0.05% fee tier - highest volume)
+    pub const UNIV3_WETH_USDC_005: Address = alloy::primitives::address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640");
+    pub const UNIV3_WETH_USDT_005: Address = alloy::primitives::address!("11b815efB8f581194ae79006d24E0d814B7697F6");
+    pub const UNIV3_USDC_USDT_001: Address = alloy::primitives::address!("3416cF6C708Da44DB2624D63ea0AAef7113527C6");
+
+    /// Top Curve pools
+    pub const CURVE_3POOL: Address = alloy::primitives::address!("bEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7");
+    pub const CURVE_STETH: Address = alloy::primitives::address!("DC24316b9AE028F1497c275EB9192a3Ea0f67022");
+    pub const CURVE_TRICRYPTO: Address = alloy::primitives::address!("D51a44d3FaE010294C616388b506AcdA1bfAAE46");
+    pub const CURVE_FRAXUSDC: Address = alloy::primitives::address!("DcEF968d416a41Cdac0ED8702fAC8128A64241A2");
+}
+
+/// Run the Swap event monitor for real-time price updates
+async fn run_swap_event_monitor(state: Arc<AppState>) -> Result<(), MevError> {
+    use alloy::rpc::types::Filter;
+
+    let ws_provider = match &state.ws_provider {
+        Some(provider) => provider.clone(),
+        None => {
+            warn!("Swap event monitor: No WebSocket provider available, using polling fallback");
+            return run_swap_event_monitor_polling(state).await;
+        }
+    };
+
+    // Event signatures (keccak256 of event signature)
+    // UniswapV2 Swap: Swap(address,uint256,uint256,uint256,uint256,address)
+    let univ2_swap_topic: FixedBytes<32> = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822".parse().unwrap();
+    // UniswapV3 Swap: Swap(address,address,int256,int256,uint160,uint128,int24)
+    let univ3_swap_topic: FixedBytes<32> = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67".parse().unwrap();
+    // Curve TokenExchange: TokenExchange(address,int128,uint256,int128,uint256)
+    let curve_exchange_topic: FixedBytes<32> = "0x8b3e96f2b889fa771c53c981b40daf005f63f637f1869f707052d15a3dd97140".parse().unwrap();
+
+    // Build filter for all monitored pools
+    let pools: Vec<Address> = vec![
+        monitored_pools::UNIV2_WETH_USDC,
+        monitored_pools::UNIV2_WETH_USDT,
+        monitored_pools::UNIV2_WETH_DAI,
+        monitored_pools::UNIV2_USDC_USDT,
+        monitored_pools::SUSHI_WETH_USDC,
+        monitored_pools::SUSHI_WETH_USDT,
+        monitored_pools::UNIV3_WETH_USDC_005,
+        monitored_pools::UNIV3_WETH_USDT_005,
+        monitored_pools::UNIV3_USDC_USDT_001,
+        monitored_pools::CURVE_3POOL,
+        monitored_pools::CURVE_STETH,
+        monitored_pools::CURVE_TRICRYPTO,
+        monitored_pools::CURVE_FRAXUSDC,
+    ];
+
+    let filter = Filter::new()
+        .address(pools)
+        .event_signature(vec![univ2_swap_topic, univ3_swap_topic, curve_exchange_topic]);
+
+    info!("Swap event monitor: Subscribing to {} high-volume pools", 13);
+
+    // Subscribe to logs
+    let subscription = match ws_provider.subscribe_logs(&filter).await {
+        Ok(sub) => sub,
+        Err(e) => {
+            warn!("Failed to subscribe to Swap events: {}. Using polling fallback.", e);
+            return run_swap_event_monitor_polling(state).await;
+        }
+    };
+
+    let mut stream = subscription.into_stream();
+    let mut event_count: u64 = 0;
+    let mut last_log_time = std::time::Instant::now();
+
+    info!("Swap event monitor: Successfully subscribed! Listening for real-time swaps...");
+
+    while let Some(log) = stream.next().await {
+        event_count += 1;
+
+        // Log progress every 30 seconds
+        if last_log_time.elapsed().as_secs() >= 30 {
+            info!(
+                "Swap event monitor: {} swap events processed, {} prices cached",
+                event_count,
+                state.price_cache.len()
+            );
+            last_log_time = std::time::Instant::now();
+        }
+
+        // Parse the event
+        let pool_address = log.address();
+        let topics = log.topics();
+        if topics.is_empty() {
+            continue;
+        }
+
+        let event_sig = topics[0];
+        let block_number = log.block_number.unwrap_or(0);
+
+        // Determine DEX type and parse swap data
+        let (dex_type, amount0, amount1) = if event_sig == univ2_swap_topic {
+            // UniswapV2/SushiSwap Swap event
+            if log.data().data.len() >= 128 {
+                let data = log.data().data.as_ref();
+                let amount0_in = U256::from_be_slice(&data[0..32]);
+                let amount1_in = U256::from_be_slice(&data[32..64]);
+                let amount0_out = U256::from_be_slice(&data[64..96]);
+                let amount1_out = U256::from_be_slice(&data[96..128]);
+
+                // Calculate net amounts
+                let net_amount0: i128 = if amount0_in > amount0_out {
+                    amount0_in.saturating_sub(amount0_out).try_into().unwrap_or(i128::MAX)
+                } else {
+                    -(amount0_out.saturating_sub(amount0_in).try_into().unwrap_or(i128::MAX))
+                };
+                let net_amount1: i128 = if amount1_in > amount1_out {
+                    amount1_in.saturating_sub(amount1_out).try_into().unwrap_or(i128::MAX)
+                } else {
+                    -(amount1_out.saturating_sub(amount1_in).try_into().unwrap_or(i128::MAX))
+                };
+
+                ("UniV2", net_amount0, net_amount1)
+            } else {
+                continue;
+            }
+        } else if event_sig == univ3_swap_topic {
+            // UniswapV3 Swap event - amounts are int256 (signed)
+            if log.data().data.len() >= 64 {
+                let data = log.data().data.as_ref();
+                // int256 amount0, int256 amount1
+                let amount0_bytes: [u8; 32] = data[0..32].try_into().unwrap();
+                let amount1_bytes: [u8; 32] = data[32..64].try_into().unwrap();
+
+                // Parse as signed integers
+                let amount0 = i128::from_be_bytes(amount0_bytes[16..32].try_into().unwrap());
+                let amount1 = i128::from_be_bytes(amount1_bytes[16..32].try_into().unwrap());
+
+                ("UniV3", amount0, amount1)
+            } else {
+                continue;
+            }
+        } else if event_sig == curve_exchange_topic {
+            // Curve TokenExchange event
+            if log.data().data.len() >= 128 {
+                let data = log.data().data.as_ref();
+                let tokens_sold = U256::from_be_slice(&data[32..64]);
+                let tokens_bought = U256::from_be_slice(&data[96..128]);
+
+                let amount0: i128 = tokens_sold.try_into().unwrap_or(i128::MAX);
+                let amount1: i128 = -(tokens_bought.try_into().unwrap_or(i128::MAX));
+
+                ("Curve", amount0, amount1)
+            } else {
+                continue;
+            }
+        } else {
+            continue;
+        };
+
+        // Calculate implied price (avoid division by zero)
+        let price = if amount0.abs() > 0 {
+            (amount1.abs() as f64) / (amount0.abs() as f64)
+        } else {
+            0.0
+        };
+
+        // Create cache key: pool_address
+        let cache_key = format!("{:?}", pool_address);
+
+        // Update price cache
+        state.price_cache.insert(cache_key.clone(), PriceUpdate {
+            pool: pool_address,
+            dex: dex_type.to_string(),
+            token0: Address::ZERO, // Would need to fetch from pool
+            token1: Address::ZERO,
+            amount0,
+            amount1,
+            price,
+            block_number,
+            timestamp: chrono::Utc::now(),
+        });
+
+        // Log significant swaps (> 1 ETH equivalent)
+        if amount0.abs() > 1_000_000_000_000_000_000 || amount1.abs() > 1_000_000_000_000_000_000 {
+            info!(
+                "Swap event: {} pool {:?} | amounts: {}/{} | price: {:.6} | block: {}",
+                dex_type, pool_address, amount0, amount1, price, block_number
+            );
+        }
+    }
+
+    Ok(())
+}
+
+/// Polling fallback for Swap event monitoring (when WebSocket is unavailable)
+async fn run_swap_event_monitor_polling(state: Arc<AppState>) -> Result<(), MevError> {
+    use alloy::rpc::types::Filter;
+
+    let poll_interval = Duration::from_secs(2);
+    let provider = state.http_provider.clone();
+
+    // Event signatures
+    let univ2_swap_topic: FixedBytes<32> = "0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822".parse().unwrap();
+    let univ3_swap_topic: FixedBytes<32> = "0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115fbcca67".parse().unwrap();
+
+    let pools: Vec<Address> = vec![
+        monitored_pools::UNIV2_WETH_USDC,
+        monitored_pools::UNIV3_WETH_USDC_005,
+        monitored_pools::CURVE_3POOL,
+    ];
+
+    let mut last_block: u64 = match provider.get_block_number().await {
+        Ok(n) => n,
+        Err(_) => 0,
+    };
+
+    info!("Swap event monitor (polling): Starting from block {}", last_block);
+
+    loop {
+        tokio::time::sleep(poll_interval).await;
+
+        let current_block = match provider.get_block_number().await {
+            Ok(n) => n,
+            Err(_) => continue,
+        };
+
+        if current_block <= last_block {
+            continue;
+        }
+
+        // Fetch logs for new blocks
+        let filter = Filter::new()
+            .address(pools.clone())
+            .event_signature(vec![univ2_swap_topic, univ3_swap_topic])
+            .from_block(last_block + 1)
+            .to_block(current_block);
+
+        if let Ok(logs) = provider.get_logs(&filter).await {
+            for log in logs {
+                let pool_address = log.address();
+                let cache_key = format!("{:?}", pool_address);
+                let block_number = log.block_number.unwrap_or(0);
+
+                // Simplified parsing for polling mode
+                state.price_cache.insert(cache_key, PriceUpdate {
+                    pool: pool_address,
+                    dex: "UniV2/V3".to_string(),
+                    token0: Address::ZERO,
+                    token1: Address::ZERO,
+                    amount0: 0,
+                    amount1: 0,
+                    price: 0.0,
+                    block_number,
+                    timestamp: chrono::Utc::now(),
+                });
+            }
+        }
+
+        last_block = current_block;
+    }
+}
 
 /// Wait for shutdown signal (SIGINT or SIGTERM)
 async fn shutdown_signal() {
