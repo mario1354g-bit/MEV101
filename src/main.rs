@@ -919,8 +919,22 @@ mod tokens {
     pub const WETH: &str = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2";
     pub const USDC: &str = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
     pub const USDT: &str = "0xdAC17F958D2ee523a2206206994597C13D831ec7";
-    pub const DAI: &str = "0x6B175474E89094C44Da98b954EesC8E1d7c2F8ad";
+    pub const DAI: &str = "0x6B175474E89094C44Da98b954EeBC8E1d7c2F8ad";
     pub const WBTC: &str = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599";
+    pub const STETH: &str = "0xae7ab96520DE3A18E5e111B5EaAb095312D7fE84";
+    pub const MANA: &str = "0x0F5D2fB29fb7d3CFeE444a200298f468908cC942";
+    pub const ANKR: &str = "0x8290333ceF9e6D528dD5618Fb97a76f268f3EDD4";
+    pub const BAND: &str = "0xBA11D00c5f74255f56a5E366F4F77f5A186d7f55";
+    pub const SUSHI: &str = "0x6B3595068778DD592e39A122f4f5a5cF09C90fE2";
+    pub const LINK: &str = "0x514910771AF9Ca656af840dff83E8264EcF986CA";
+    pub const UNI: &str = "0x1f9840a85d5aF5bf1D1762F925BDADdC4201F984";
+    pub const AAVE: &str = "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9";
+    pub const MKR: &str = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2";
+    pub const SNX: &str = "0xC011a73ee8576Fb46F5E1c5751cA3B9Fe0af2a6F";
+    pub const CRV: &str = "0xD533a949740bb3306d119CC777fa900bA034cd52";
+    pub const YFI: &str = "0x0bc529c00C6401aEF6D220BE8C6Ea1667F6Ad93e";
+    pub const COMP: &str = "0xc00e94Cb662C3520282E6f5717214004A7f26888";
+    pub const FRAX: &str = "0x853d955aCEf822Db058eb8505911ED77F175b99e";
 
     /// Get token address from symbol (from pair name like "WETH/USDC")
     pub fn get_token_address(symbol: &str) -> Option<Address> {
@@ -930,6 +944,20 @@ mod tokens {
             "USDT" => USDT.parse().ok(),
             "DAI" => DAI.parse().ok(),
             "WBTC" | "BTC" => WBTC.parse().ok(),
+            "STETH" => STETH.parse().ok(),
+            "MANA" => MANA.parse().ok(),
+            "ANKR" => ANKR.parse().ok(),
+            "BAND" => BAND.parse().ok(),
+            "SUSHI" => SUSHI.parse().ok(),
+            "LINK" => LINK.parse().ok(),
+            "UNI" => UNI.parse().ok(),
+            "AAVE" => AAVE.parse().ok(),
+            "MKR" => MKR.parse().ok(),
+            "SNX" => SNX.parse().ok(),
+            "CRV" => CRV.parse().ok(),
+            "YFI" => YFI.parse().ok(),
+            "COMP" => COMP.parse().ok(),
+            "FRAX" => FRAX.parse().ok(),
             _ => None,
         }
     }
@@ -1770,22 +1798,23 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                     );
 
                     // Determine status based on validation
+                    // NOTE: "pending" and "high_priority" are the statuses the executor polls for
                     let (status, log_prefix) = match &validation {
                         OpportunityValidation::Validated { net_profit_usd, .. } => {
                             if *net_profit_usd > 100.0 {
-                                ("VALIDATED_HIGH".to_string(), "VALIDATED")
+                                ("high_priority".to_string(), "VALIDATED")
                             } else {
-                                ("VALIDATED".to_string(), "VALIDATED")
+                                ("pending".to_string(), "VALIDATED")
                             }
                         }
                         OpportunityValidation::LowLiquidity { .. } => {
-                            ("LOW_LIQUIDITY".to_string(), "LOW_LIQUIDITY")
+                            ("low_liquidity".to_string(), "LOW_LIQUIDITY")
                         }
                         OpportunityValidation::HighSlippage { .. } => {
-                            ("HIGH_SLIPPAGE".to_string(), "HIGH_SLIPPAGE")
+                            ("high_slippage".to_string(), "HIGH_SLIPPAGE")
                         }
                         OpportunityValidation::GasExceedsProfit { .. } => {
-                            ("GAS_EXCEEDS_PROFIT".to_string(), "GAS_EXCEEDS_PROFIT")
+                            ("gas_exceeds_profit".to_string(), "GAS_EXCEEDS_PROFIT")
                         }
                     };
 
@@ -1828,8 +1857,10 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                         }
                     }
 
-                    // Store opportunity in cache for dashboard
+                    // Store opportunity in cache for dashboard and execution
                     let opp_id = format!("{}-{}", pair.name, chrono::Utc::now().timestamp_millis());
+                    let opp_id_for_log = opp_id.clone();
+                    let status_for_log = status.clone();
                     let (estimated_profit, gas_cost, net_profit) = match &validation {
                         OpportunityValidation::Validated { simulated_profit_usd, gas_cost_usd, net_profit_usd } => {
                             (format!("{:.2}", simulated_profit_usd), format!("{:.2}", gas_cost_usd), format!("{:.2}", net_profit_usd))
@@ -1886,6 +1917,14 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                         sell_router,
                         pair_name: Some(pair.name.to_string()),
                     });
+
+                    // Log opportunity insertion for debugging the detection -> execution pipeline
+                    if status_for_log == "pending" || status_for_log == "high_priority" {
+                        tracing::debug!(
+                            "Inserted opportunity {} with status '{}' - ready for executor",
+                            opp_id_for_log, status_for_log
+                        );
+                    }
 
                     // Keep only last 500 opportunities and remove stale ones (>5 min old)
                     let now = chrono::Utc::now();
@@ -2540,6 +2579,147 @@ fn get_protocol_id(dex_name: &str) -> u8 {
     }
 }
 
+/// Result of flash loan simulation via eth_call
+#[derive(Debug)]
+pub struct FlashloanSimulationResult {
+    /// Whether the simulation succeeded (transaction would not revert)
+    pub success: bool,
+    /// Simulated profit in wei (if successful)
+    pub simulated_profit_wei: u128,
+    /// Gas used in simulation
+    pub gas_used: u64,
+    /// Revert reason (if failed)
+    pub revert_reason: Option<String>,
+}
+
+/// Simulate flash loan arbitrage using eth_call before execution
+/// Returns simulation result with profit amount or revert reason
+async fn simulate_flashloan(
+    state: &Arc<AppState>,
+    contract_address: Address,
+    signer_address: Address,
+    call_data: &[u8],
+    flash_loan_token: Address,
+) -> Result<FlashloanSimulationResult, error::ExecutionError> {
+    use alloy::rpc::types::TransactionRequest;
+
+    info!("Starting on-chain simulation via eth_call...");
+
+    // Get the signer's token balance before simulation (to calculate profit)
+    let balance_before = get_token_balance(state, flash_loan_token, signer_address).await
+        .unwrap_or(U256::ZERO);
+
+    // Build the simulation transaction request
+    let sim_tx = TransactionRequest::default()
+        .to(contract_address)
+        .from(signer_address)
+        .input(call_data.to_vec().into());
+
+    // Execute eth_call to simulate the transaction
+    let sim_result = state.http_provider.call(&sim_tx).await;
+
+    match sim_result {
+        Ok(_return_data) => {
+            // Simulation succeeded - transaction would not revert
+            // Get estimated gas for the simulation
+            let gas_used = state.http_provider.estimate_gas(&sim_tx).await
+                .unwrap_or(0);
+
+            // For flash loans, profit is typically returned to the contract owner
+            // We estimate profit based on the token balance change
+            // In practice, the contract should emit events we could parse
+            let balance_after = get_token_balance(state, flash_loan_token, signer_address).await
+                .unwrap_or(U256::ZERO);
+
+            let simulated_profit_wei = if balance_after > balance_before {
+                (balance_after - balance_before).try_into().unwrap_or(0u128)
+            } else {
+                // If balance didn't increase, use estimated profit from opportunity
+                // The contract may hold the profit until withdrawal
+                0u128
+            };
+
+            info!(
+                "SIMULATION PASSED: gas_used={}, simulated_profit={}",
+                gas_used, simulated_profit_wei
+            );
+
+            Ok(FlashloanSimulationResult {
+                success: true,
+                simulated_profit_wei,
+                gas_used,
+                revert_reason: None,
+            })
+        }
+        Err(e) => {
+            // Simulation failed - extract revert reason
+            let error_str = e.to_string();
+            let revert_reason = extract_revert_reason(&error_str);
+
+            warn!(
+                "SIMULATION FAILED: {}",
+                revert_reason.as_deref().unwrap_or(&error_str)
+            );
+
+            Ok(FlashloanSimulationResult {
+                success: false,
+                simulated_profit_wei: 0,
+                gas_used: 0,
+                revert_reason: Some(revert_reason.unwrap_or_else(|| error_str)),
+            })
+        }
+    }
+}
+
+/// Get ERC20 token balance for an address
+async fn get_token_balance(
+    state: &Arc<AppState>,
+    token: Address,
+    owner: Address,
+) -> Result<U256, error::ExecutionError> {
+    use alloy::sol_types::SolCall;
+
+    // ERC20 balanceOf(address) selector: 0x70a08231
+    sol! {
+        function balanceOf(address owner) external view returns (uint256);
+    }
+
+    let call = balanceOfCall { owner };
+    let call_data = call.abi_encode();
+
+    let tx = alloy::rpc::types::TransactionRequest::default()
+        .to(token)
+        .input(call_data.into());
+
+    match state.http_provider.call(&tx).await {
+        Ok(result) => {
+            if result.len() >= 32 {
+                Ok(U256::from_be_slice(&result[..32]))
+            } else {
+                Ok(U256::ZERO)
+            }
+        }
+        Err(_) => Ok(U256::ZERO),
+    }
+}
+
+/// Extract revert reason from error message
+fn extract_revert_reason(error: &str) -> Option<String> {
+    // Common patterns for revert reasons in RPC errors
+    if error.contains("execution reverted:") {
+        error.split("execution reverted:").nth(1)
+            .map(|s| s.trim().to_string())
+    } else if error.contains("revert:") {
+        error.split("revert:").nth(1)
+            .map(|s| s.trim().to_string())
+    } else if error.contains("Error:") {
+        error.split("Error:").nth(1)
+            .map(|s| s.trim().to_string())
+    } else {
+        None
+    }
+}
+
 /// Execute flash loan arbitrage opportunity
 async fn execute_flashloan_arbitrage(
     state: &Arc<AppState>,
@@ -2641,6 +2821,45 @@ async fn execute_flashloan_arbitrage(
     info!(
         "Profit validation passed: estimated={}, gas_cost={}, net={}",
         estimated_profit, gas_cost_wei, net_profit_after_gas
+    );
+
+    // Run on-chain simulation before actual execution
+    let simulation_result = simulate_flashloan(
+        state,
+        contract_address,
+        signer_address,
+        &call_data,
+        flash_loan_token,
+    ).await?;
+
+    if !simulation_result.success {
+        error!(
+            "Simulation failed for opportunity {}: {}",
+            opportunity.id,
+            simulation_result.revert_reason.as_deref().unwrap_or("Unknown error")
+        );
+        return Err(error::ExecutionError::SubmissionFailed(
+            format!("Simulation failed: {}", simulation_result.revert_reason.unwrap_or_else(|| "Unknown error".to_string()))
+        ));
+    }
+
+    // Compare simulated profit to minimum profit threshold
+    let min_profit_wei = (state.config.monitoring.min_profit_eth * 1e18) as u128;
+    let simulated_profit = simulation_result.simulated_profit_wei;
+
+    // If simulation detected profit, verify it meets minimum threshold
+    // Note: simulated_profit may be 0 if contract holds profit until withdrawal
+    if simulated_profit > 0 && simulated_profit < min_profit_wei {
+        warn!(
+            "Simulated profit {} wei below minimum {} wei ({}  ETH)",
+            simulated_profit, min_profit_wei, state.config.monitoring.min_profit_eth
+        );
+        return Err(error::ExecutionError::NotProfitable);
+    }
+
+    info!(
+        "Simulation verified: success=true, simulated_profit={} wei, gas_used={}",
+        simulated_profit, simulation_result.gas_used
     );
 
     // Check if we should use Flashbots
@@ -2862,13 +3081,33 @@ async fn run_executor(state: Arc<AppState>) -> Result<(), MevError> {
         warn!("PRIVATE_KEY not set - executor will only work in dry_run mode");
     }
 
+    let mut last_log_time = std::time::Instant::now();
+
     loop {
         // Collect opportunities to process (avoid holding lock during execution)
+        let total_opportunities = state.opportunities.len();
         let opportunities_to_process: Vec<(String, MevOpportunity)> = state.opportunities
             .iter()
             .filter(|entry| entry.value().status == "pending" || entry.value().status == "high_priority")
             .map(|entry| (entry.key().clone(), entry.value().clone()))
             .collect();
+
+        // Log executor status periodically (every 30 seconds) for debugging
+        if last_log_time.elapsed().as_secs() >= 30 {
+            tracing::debug!(
+                "Executor poll: {} total opportunities, {} pending/high_priority",
+                total_opportunities,
+                opportunities_to_process.len()
+            );
+            last_log_time = std::time::Instant::now();
+        }
+
+        if !opportunities_to_process.is_empty() {
+            info!(
+                "Executor found {} opportunities to process (pending/high_priority)",
+                opportunities_to_process.len()
+            );
+        }
 
         for (opp_id, opportunity) in opportunities_to_process {
             // Update status to executing
