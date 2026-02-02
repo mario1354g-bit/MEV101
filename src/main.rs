@@ -4,6 +4,7 @@ mod error;
 use std::sync::Arc;
 use std::time::Duration;
 
+use alloy::consensus::Transaction as TxTrait;
 use alloy::primitives::{Address, Bytes, FixedBytes, U256};
 use alloy::providers::{Provider, ProviderBuilder, RootProvider, WsConnect};
 use alloy::sol;
@@ -364,6 +365,25 @@ async fn async_main() -> Result<(), MevError> {
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Detector shutting down");
+                }
+            }
+        }));
+    }
+
+    // Liquidation monitor
+    {
+        let state = Arc::clone(&app_state);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        handles.push(tokio::spawn(async move {
+            info!("Starting liquidation monitor (Aave V3, Compound V3)");
+            tokio::select! {
+                result = run_liquidation_monitor(state) => {
+                    if let Err(e) = result {
+                        error!("Liquidation monitor error: {}", e);
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Liquidation monitor shutting down");
                 }
             }
         }));
@@ -751,7 +771,105 @@ async fn run_mempool_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                                     if pending_tx_count <= 5 || pending_tx_count % 100 == 0 {
                                         info!("Mempool monitor: Received pending tx #{}: {:?}", pending_tx_count, hash);
                                     }
-                                    tracing::debug!("Pending tx: {:?}", hash);
+
+                                    // Fetch full transaction data for sandwich/backrun detection
+                                    // Only fetch every 10th tx to avoid rate limits
+                                    if pending_tx_count % 10 == 0 {
+                                        let provider = state.http_provider.clone();
+                                        let pending_txs = state.pending_txs.clone();
+                                        let opportunities = state.opportunities.clone();
+
+                                        tokio::spawn(async move {
+                                            if let Ok(Some(tx)) = provider.get_transaction_by_hash(hash).await {
+                                                // Access inner transaction data
+                                                let inner = &tx.inner;
+                                                // Check if this is a DEX swap (potential sandwich target)
+                                                if let Some(to) = inner.to() {
+                                                    let input = inner.input();
+                                                    if input.len() >= 4 {
+                                                        let selector = &input[0..4];
+                                                        // Common DEX swap selectors
+                                                        let is_swap = matches!(selector,
+                                                            // UniV2: swapExactTokensForTokens, swapTokensForExactTokens, etc.
+                                                            [0x38, 0xed, 0x17, 0x39] | // swapExactTokensForTokens
+                                                            [0x88, 0x03, 0xdb, 0xee] | // swapTokensForExactTokens
+                                                            [0x7f, 0xf3, 0x6a, 0xb5] | // swapExactETHForTokens
+                                                            [0x18, 0xcb, 0xaf, 0xe5] | // swapExactTokensForETH
+                                                            [0xfb, 0x3b, 0xdb, 0x41] | // swapETHForExactTokens
+                                                            [0x4a, 0x25, 0xd9, 0x4a] | // swapTokensForExactETH
+                                                            // UniV3: exactInputSingle, exactInput, exactOutputSingle
+                                                            [0x41, 0x4b, 0xf3, 0x89] | // exactInputSingle
+                                                            [0xc0, 0x4b, 0x8d, 0x59] | // exactInput
+                                                            [0xdb, 0x3e, 0x21, 0x98] | // exactOutputSingle
+                                                            [0xf2, 0x8c, 0x05, 0x98] | // exactOutput
+                                                            // 1inch
+                                                            [0x12, 0xaa, 0x3c, 0xaf] | // swap
+                                                            [0xe4, 0x49, 0x02, 0x2e]   // unoswap
+                                                        );
+
+                                                        if is_swap {
+                                                            let value_wei: u128 = inner.value().try_into().unwrap_or(0);
+                                                            let value_eth = value_wei as f64 / 1e18;
+                                                            let gas_price = tx.effective_gas_price.unwrap_or(inner.gas_price().unwrap_or(0));
+
+                                                            // Only track large swaps (> 0.5 ETH value or high gas price)
+                                                            if value_eth > 0.5 || gas_price > 50_000_000_000 {
+                                                                info!(
+                                                                    "SANDWICH TARGET: {:?} | value: {:.3} ETH | gas: {} gwei | to: {:?}",
+                                                                    hash, value_eth, gas_price / 1_000_000_000, to
+                                                                );
+
+                                                                // Store for sandwich opportunity detection
+                                                                let pending_tx = PendingTransaction {
+                                                                    hash: format!("{:?}", hash),
+                                                                    from: format!("{:?}", tx.from),
+                                                                    to: Some(format!("{:?}", to)),
+                                                                    value: value_wei.to_string(),
+                                                                    data: input.to_vec(),
+                                                                    gas_price: Some(gas_price),
+                                                                    max_fee_per_gas: Some(inner.max_fee_per_gas()),
+                                                                    max_priority_fee_per_gas: inner.max_priority_fee_per_gas(),
+                                                                    detected_at: chrono::Utc::now(),
+                                                                };
+                                                                pending_txs.insert(format!("{:?}", hash), pending_tx);
+
+                                                                // Create sandwich opportunity
+                                                                let opp_id = format!("sandwich-{:?}", hash);
+                                                                let estimated_profit = (value_eth * 0.003 * 1e18) as u64; // ~0.3% of trade
+                                                                let gas_cost = 300_000u64 * gas_price as u64; // ~300k gas for sandwich
+
+                                                                if estimated_profit > gas_cost + 5_000_000_000_000_000 { // > gas + 0.005 ETH
+                                                                    let net_profit = estimated_profit - gas_cost;
+                                                                    opportunities.insert(opp_id.clone(), MevOpportunity {
+                                                                        id: opp_id,
+                                                                        opportunity_type: "sandwich".to_string(),
+                                                                        target_tx: format!("{:?}", hash),
+                                                                        estimated_profit_wei: estimated_profit.to_string(),
+                                                                        estimated_gas_cost_wei: gas_cost.to_string(),
+                                                                        net_profit_wei: net_profit.to_string(),
+                                                                        detected_at: chrono::Utc::now(),
+                                                                        status: "pending".to_string(),
+                                                                        flash_loan_token: None,
+                                                                        flash_loan_amount: None,
+                                                                        swap_steps: None,
+                                                                        buy_dex: None,
+                                                                        sell_dex: None,
+                                                                        buy_router: None,
+                                                                        sell_router: None,
+                                                                        pair_name: Some("SANDWICH".to_string()),
+                                                                    });
+                                                                    info!(
+                                                                        "🥪 SANDWICH OPPORTUNITY: {} | profit: {:.4} ETH",
+                                                                        format!("{:?}", hash), net_profit as f64 / 1e18
+                                                                    );
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        });
+                                    }
                                 }
                                 None => {
                                     warn!("Mempool monitor: Subscription stream ended unexpectedly");
@@ -4412,6 +4530,279 @@ async fn run_swap_event_monitor_polling(state: Arc<AppState>) -> Result<(), MevE
         }
 
         last_block = current_block;
+    }
+}
+
+// ============================================================================
+// LIQUIDATION MONITOR - Track Aave V3 and Compound V3 positions
+// ============================================================================
+
+// Aave V3 Pool contract interface
+sol! {
+    #[sol(rpc)]
+    contract AaveV3Pool {
+        /// Get user account data
+        function getUserAccountData(address user) external view returns (
+            uint256 totalCollateralBase,
+            uint256 totalDebtBase,
+            uint256 availableBorrowsBase,
+            uint256 currentLiquidationThreshold,
+            uint256 ltv,
+            uint256 healthFactor
+        );
+    }
+
+    /// Aave LiquidationCall event
+    #[derive(Debug)]
+    event LiquidationCall(
+        address indexed collateralAsset,
+        address indexed debtAsset,
+        address indexed user,
+        uint256 debtToCover,
+        uint256 liquidatedCollateralAmount,
+        address liquidator,
+        bool receiveAToken
+    );
+}
+
+// Compound V3 Comet contract interface
+sol! {
+    #[sol(rpc)]
+    contract CompoundComet {
+        /// Check if account is liquidatable
+        function isLiquidatable(address account) external view returns (bool);
+        /// Get borrow balance
+        function borrowBalanceOf(address account) external view returns (uint256);
+        /// Get collateral balance
+        function collateralBalanceOf(address account, address asset) external view returns (uint128);
+    }
+
+    /// Compound AbsorbCollateral event
+    #[derive(Debug)]
+    event AbsorbCollateral(
+        address indexed absorber,
+        address indexed borrower,
+        address indexed asset,
+        uint256 collateralAbsorbed,
+        uint256 usdValue
+    );
+}
+
+/// Known Aave V3 and Compound V3 contract addresses
+mod lending_protocols {
+    use alloy::primitives::Address;
+
+    // Aave V3 Pool (Ethereum mainnet)
+    pub const AAVE_V3_POOL: Address = alloy::primitives::address!("87870Bca3F3fD6335C3F4ce8392D69350B4fA4E2");
+
+    // Compound V3 Comet (USDC market)
+    pub const COMPOUND_V3_USDC: Address = alloy::primitives::address!("c3d688B66703497DAA19211EEdff47f25384cdc3");
+
+    // Compound V3 Comet (WETH market)
+    pub const COMPOUND_V3_WETH: Address = alloy::primitives::address!("A17581A9E3356d9A858b789D68B4d866e593aE94");
+}
+
+/// Liquidatable position data
+#[derive(Debug, Clone)]
+pub struct LiquidatablePosition {
+    pub protocol: String,
+    pub user: Address,
+    pub health_factor: f64,
+    pub collateral_usd: f64,
+    pub debt_usd: f64,
+    pub estimated_profit_usd: f64,
+    pub detected_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Run liquidation monitor - tracks unhealthy positions on Aave V3 and Compound V3
+async fn run_liquidation_monitor(state: Arc<AppState>) -> Result<(), MevError> {
+    use alloy::rpc::types::Filter;
+
+    let poll_interval = Duration::from_secs(12); // Check every block
+    let provider = state.http_provider.clone();
+
+    // Subscribe to liquidation events via WebSocket if available
+    let liquidation_topic_aave: FixedBytes<32> = "0xe413a321e8681d831f4dbccbca790d2952b56f977908e45be37335533e005286".parse().unwrap();
+    let liquidation_topic_compound: FixedBytes<32> = "0x90b93257e4f58c516b8e6b9db52dc67d51c8a2a94c40912e97f0f2e32dc14cf0".parse().unwrap();
+
+    let mut last_log_time = std::time::Instant::now();
+    let mut positions_checked: u64 = 0;
+    let mut liquidations_found: u64 = 0;
+
+    info!("Liquidation monitor: Watching Aave V3 and Compound V3 for liquidation opportunities");
+
+    // Known large borrowers to monitor (can be populated from events)
+    let mut watched_accounts: Vec<(Address, String)> = Vec::new();
+
+    // Subscribe to liquidation events to find active borrowers
+    if let Some(ref ws_provider) = state.ws_provider {
+        let filter = Filter::new()
+            .address(vec![
+                lending_protocols::AAVE_V3_POOL,
+                lending_protocols::COMPOUND_V3_USDC,
+                lending_protocols::COMPOUND_V3_WETH,
+            ])
+            .event_signature(vec![liquidation_topic_aave, liquidation_topic_compound]);
+
+        if let Ok(subscription) = ws_provider.subscribe_logs(&filter).await {
+            info!("Liquidation monitor: Subscribed to liquidation events");
+            let mut stream = subscription.into_stream();
+
+            // Spawn event listener
+            let opportunities = state.opportunities.clone();
+            tokio::spawn(async move {
+                while let Some(log) = stream.next().await {
+                    let protocol = if log.address() == lending_protocols::AAVE_V3_POOL {
+                        "Aave V3"
+                    } else {
+                        "Compound V3"
+                    };
+
+                    info!(
+                        "💀 LIQUIDATION EVENT: {} | block: {} | tx: {:?}",
+                        protocol,
+                        log.block_number.unwrap_or(0),
+                        log.transaction_hash
+                    );
+
+                    // Could extract user from event to add to watchlist
+                }
+            });
+        }
+    }
+
+    loop {
+        // Log status every 60 seconds
+        if last_log_time.elapsed().as_secs() >= 60 {
+            info!(
+                "Liquidation monitor: {} positions checked, {} liquidatable found, {} accounts watched",
+                positions_checked,
+                liquidations_found,
+                watched_accounts.len()
+            );
+            last_log_time = std::time::Instant::now();
+        }
+
+        // Check Aave V3 health factors for watched accounts
+        for (account, _protocol) in &watched_accounts {
+            positions_checked += 1;
+
+            // Create contract instance
+            let aave_pool = AaveV3Pool::new(lending_protocols::AAVE_V3_POOL, provider.clone());
+
+            match aave_pool.getUserAccountData(*account).call().await {
+                Ok(data) => {
+                    let health_factor: u128 = data.healthFactor.try_into().unwrap_or(u128::MAX);
+                    let health_factor_f64 = health_factor as f64 / 1e18;
+
+                    // Position is liquidatable when health factor < 1.0
+                    if health_factor_f64 < 1.0 && health_factor_f64 > 0.0 {
+                        liquidations_found += 1;
+
+                        let collateral_usd: u128 = data.totalCollateralBase.try_into().unwrap_or(0);
+                        let debt_usd: u128 = data.totalDebtBase.try_into().unwrap_or(0);
+
+                        // Aave allows liquidating up to 50% of debt, with 5-10% bonus
+                        let liquidation_bonus = 0.05; // 5% bonus
+                        let max_liquidatable = debt_usd as f64 * 0.5 / 1e8; // Convert from 8 decimals
+                        let estimated_profit = max_liquidatable * liquidation_bonus;
+
+                        info!(
+                            "💀 LIQUIDATABLE POSITION: Aave V3 | user: {:?} | HF: {:.4} | collateral: ${:.2} | debt: ${:.2} | est profit: ${:.2}",
+                            account,
+                            health_factor_f64,
+                            collateral_usd as f64 / 1e8,
+                            debt_usd as f64 / 1e8,
+                            estimated_profit
+                        );
+
+                        // Create liquidation opportunity
+                        if estimated_profit > 10.0 { // > $10 profit
+                            let opp_id = format!("liquidation-aave-{:?}", account);
+                            let profit_wei = (estimated_profit * 1e18 / 2500.0) as u64; // Convert USD to ETH (rough)
+                            let gas_cost = 500_000u64 * 30_000_000_000u64; // 500k gas at 30 gwei
+
+                            state.opportunities.insert(opp_id.clone(), MevOpportunity {
+                                id: opp_id,
+                                opportunity_type: "liquidation".to_string(),
+                                target_tx: format!("{:?}", account),
+                                estimated_profit_wei: profit_wei.to_string(),
+                                estimated_gas_cost_wei: gas_cost.to_string(),
+                                net_profit_wei: profit_wei.saturating_sub(gas_cost).to_string(),
+                                detected_at: chrono::Utc::now(),
+                                status: "pending".to_string(),
+                                flash_loan_token: None,
+                                flash_loan_amount: None,
+                                swap_steps: None,
+                                buy_dex: None,
+                                sell_dex: None,
+                                buy_router: None,
+                                sell_router: None,
+                                pair_name: Some("AAVE-LIQUIDATION".to_string()),
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::trace!("Failed to get Aave account data for {:?}: {}", account, e);
+                }
+            }
+        }
+
+        // Check Compound V3 for liquidatable positions
+        for comet_address in [lending_protocols::COMPOUND_V3_USDC, lending_protocols::COMPOUND_V3_WETH] {
+            for (account, _) in &watched_accounts {
+                let comet = CompoundComet::new(comet_address, provider.clone());
+
+                match comet.isLiquidatable(*account).call().await {
+                    Ok(is_liquidatable) => {
+                        if is_liquidatable._0 {
+                            liquidations_found += 1;
+
+                            info!(
+                                "💀 LIQUIDATABLE POSITION: Compound V3 | user: {:?} | comet: {:?}",
+                                account, comet_address
+                            );
+
+                            let opp_id = format!("liquidation-compound-{:?}-{:?}", comet_address, account);
+                            state.opportunities.insert(opp_id.clone(), MevOpportunity {
+                                id: opp_id,
+                                opportunity_type: "liquidation".to_string(),
+                                target_tx: format!("{:?}", account),
+                                estimated_profit_wei: "10000000000000000".to_string(), // 0.01 ETH estimate
+                                estimated_gas_cost_wei: "15000000000000000".to_string(), // 0.015 ETH gas
+                                net_profit_wei: "0".to_string(),
+                                detected_at: chrono::Utc::now(),
+                                status: "pending".to_string(),
+                                flash_loan_token: None,
+                                flash_loan_amount: None,
+                                swap_steps: None,
+                                buy_dex: None,
+                                sell_dex: None,
+                                buy_router: None,
+                                sell_router: None,
+                                pair_name: Some("COMPOUND-LIQUIDATION".to_string()),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        tracing::trace!("Failed to check Compound liquidatable for {:?}: {}", account, e);
+                    }
+                }
+            }
+        }
+
+        // Discover new accounts from recent borrow events (simplified - would need event parsing)
+        // For now, add some known large borrowers to watch
+        if watched_accounts.is_empty() {
+            // These are example addresses - in production, discover from events
+            watched_accounts.push((
+                "0x0000000000000000000000000000000000000001".parse().unwrap(),
+                "Aave V3".to_string()
+            ));
+        }
+
+        tokio::time::sleep(poll_interval).await;
     }
 }
 
