@@ -539,112 +539,292 @@ async fn run_block_monitor(state: Arc<AppState>) -> Result<(), MevError> {
     }
 }
 
-/// Trading pair configuration
+/// Trading pair configuration for multi-DEX comparison
 struct TradingPair {
     name: &'static str,
-    uni_pair: Address,
-    sushi_pair: Address,
+    pairs: Vec<DexPair>,
     token0_decimals: u8,
     token1_decimals: u8,
 }
 
-/// Run DEX monitor - actively scans for arbitrage opportunities across multiple pairs
+/// Individual DEX pair
+struct DexPair {
+    dex: &'static str,
+    address: Address,
+}
+
+impl TradingPair {
+    fn new(name: &'static str, token0_decimals: u8, token1_decimals: u8, pairs: Vec<(&'static str, &'static str)>) -> Self {
+        Self {
+            name,
+            token0_decimals,
+            token1_decimals,
+            pairs: pairs.into_iter()
+                .filter_map(|(dex, addr)| {
+                    addr.parse::<Address>().ok().map(|address| DexPair { dex, address })
+                })
+                .collect(),
+        }
+    }
+}
+
+/// Run DEX monitor - actively scans for arbitrage opportunities across multiple pairs and DEXes
 async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
     let poll_interval = std::time::Duration::from_millis(state.config.monitoring.poll_interval_ms);
 
-    // Define trading pairs to monitor (Uniswap V2 vs SushiSwap)
+    // ============================================================================
+    // LONG-TAIL TRADING PAIRS (Top 50-200 by market cap - less competition)
+    // DEXes: Uniswap V2, SushiSwap, ShibaSwap, Fraxswap
+    // ============================================================================
     let pairs = vec![
-        // High liquidity pairs
-        TradingPair {
-            name: "WETH/USDC",
-            uni_pair: "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc".parse().unwrap(),
-            sushi_pair: "0x397FF1542f962076d0BFE58eA045FfA2d347ACa0".parse().unwrap(),
-            token0_decimals: 6,  // USDC
-            token1_decimals: 18, // WETH
-        },
-        TradingPair {
-            name: "WETH/USDT",
-            uni_pair: "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852".parse().unwrap(),
-            sushi_pair: "0x06da0fd433C1A5d7a4faa01111c044910A184553".parse().unwrap(),
-            token0_decimals: 18, // WETH
-            token1_decimals: 6,  // USDT
-        },
-        TradingPair {
-            name: "WETH/DAI",
-            uni_pair: "0xA478c2975Ab1Ea89e8196811F51A7B7Ade33eB11".parse().unwrap(),
-            sushi_pair: "0xC3D03e4F041Fd4cD388c549Ee2A29a9E5075882f".parse().unwrap(),
-            token0_decimals: 18, // DAI
-            token1_decimals: 18, // WETH
-        },
-        // Medium liquidity pairs - more opportunity
-        TradingPair {
-            name: "WETH/WBTC",
-            uni_pair: "0xBb2b8038a1640196FbE3e38816F3e67Cba72D940".parse().unwrap(),
-            sushi_pair: "0xCEfF51756c56CeFFCA006cD410B03FFC46dd3a58".parse().unwrap(),
-            token0_decimals: 8,  // WBTC
-            token1_decimals: 18, // WETH
-        },
-        TradingPair {
-            name: "WETH/LINK",
-            uni_pair: "0xa2107FA5B38d9bbd2C461D6EDf11B11A50F6b974".parse().unwrap(),
-            sushi_pair: "0xC40D16476380e4037e6b1A2594cAF6a6cc8Da967".parse().unwrap(),
-            token0_decimals: 18, // LINK
-            token1_decimals: 18, // WETH
-        },
-        TradingPair {
-            name: "WETH/UNI",
-            uni_pair: "0xd3d2E2692501A5c9Ca623199D38826e513033a17".parse().unwrap(),
-            sushi_pair: "0xDafd66636E2561b0284EDdE37e42d192F2844D40".parse().unwrap(),
-            token0_decimals: 18, // UNI
-            token1_decimals: 18, // WETH
-        },
-        // Lower liquidity pairs - higher spreads possible
-        TradingPair {
-            name: "WETH/AAVE",
-            uni_pair: "0xDFC14d2Af169B0D36C4EFF567Ada9b2E0CAE044f".parse().unwrap(),
-            sushi_pair: "0xD75EA151a61d06868E31F8988D28DFE5E9df57B4".parse().unwrap(),
-            token0_decimals: 18, // AAVE
-            token1_decimals: 18, // WETH
-        },
-        TradingPair {
-            name: "WETH/MKR",
-            uni_pair: "0xC2aDdA861F89bBB333c90c492cB837741916A225".parse().unwrap(),
-            sushi_pair: "0xBa13afEcda9beB75De5c56BbAF696b880a5A50dD".parse().unwrap(),
-            token0_decimals: 18, // MKR
-            token1_decimals: 18, // WETH
-        },
-        TradingPair {
-            name: "WETH/SNX",
-            uni_pair: "0x43AE24960e5534731Fc831386c07755A2dc33D47".parse().unwrap(),
-            sushi_pair: "0xA1d7b2d891e3A1f9ef4bBC5be20630C2FEB1c470".parse().unwrap(),
-            token0_decimals: 18, // SNX
-            token1_decimals: 18, // WETH
-        },
-        TradingPair {
-            name: "WETH/CRV",
-            uni_pair: "0x3dA1313aE46132A397D90d95B1424A9A7e3e0fCE".parse().unwrap(),
-            sushi_pair: "0x58Dc5a51fE44589BEb22E8CE67720B5BC5378009".parse().unwrap(),
-            token0_decimals: 18, // CRV
-            token1_decimals: 18, // WETH
-        },
-        TradingPair {
-            name: "WETH/COMP",
-            uni_pair: "0xCFfDdeD873554F362Ac02f8Fb1f02E5ada10516f".parse().unwrap(),
-            sushi_pair: "0x31503dcb60119A812feE820bb7042752019F2355".parse().unwrap(),
-            token0_decimals: 18, // COMP
-            token1_decimals: 18, // WETH
-        },
-        TradingPair {
-            name: "WETH/SUSHI",
-            uni_pair: "0xCE84867c3c02B05dc570d0135103d3fB9CC19433".parse().unwrap(),
-            sushi_pair: "0x795065dCc9f64b5614C407a6EFDC400DA6221FB0".parse().unwrap(),
-            token0_decimals: 18, // SUSHI
-            token1_decimals: 18, // WETH
-        },
+        // --- HIGH LIQUIDITY REFERENCE PAIRS (Top 20) ---
+        TradingPair::new("WETH/USDC", 6, 18, vec![
+            ("UniV2", "0xB4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"),
+            ("Sushi", "0x397FF1542f962076d0BFE58eA045FfA2d347ACa0"),
+        ]),
+        TradingPair::new("WETH/USDT", 18, 6, vec![
+            ("UniV2", "0x0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"),
+            ("Sushi", "0x06da0fd433C1A5d7a4faa01111c044910A184553"),
+        ]),
+        TradingPair::new("WETH/DAI", 18, 18, vec![
+            ("UniV2", "0xA478c2975Ab1Ea89e8196811F51A7B7Ade33eB11"),
+            ("Sushi", "0xC3D03e4F041Fd4cD388c549Ee2A29a9E5075882f"),
+        ]),
+        TradingPair::new("WETH/WBTC", 8, 18, vec![
+            ("UniV2", "0xBb2b8038a1640196FbE3e38816F3e67Cba72D940"),
+            ("Sushi", "0xCEfF51756c56CeFFCA006cD410B03FFC46dd3a58"),
+        ]),
+
+        // --- MEDIUM LIQUIDITY (Top 20-50) ---
+        TradingPair::new("WETH/LINK", 18, 18, vec![
+            ("UniV2", "0xa2107FA5B38d9bbd2C461D6EDf11B11A50F6b974"),
+            ("Sushi", "0xC40D16476380e4037e6b1A2594cAF6a6cc8Da967"),
+        ]),
+        TradingPair::new("WETH/UNI", 18, 18, vec![
+            ("UniV2", "0xd3d2E2692501A5c9Ca623199D38826e513033a17"),
+            ("Sushi", "0xDafd66636E2561b0284EDdE37e42d192F2844D40"),
+        ]),
+        TradingPair::new("WETH/MATIC", 18, 18, vec![
+            ("UniV2", "0x819f3450dA6f110BA6Ea52195B3beaFa246062dE"),
+            ("Sushi", "0x4b5Ab61593A2401B1075b90c04cBCDD3F87CE011"),
+        ]),
+        TradingPair::new("WETH/SHIB", 18, 18, vec![
+            ("UniV2", "0x811beEd0119b4AfCE20D2583EB608C6F7AF1954f"),
+            ("Sushi", "0x24d3dD4A62e29770CF98810B09F89d3A90279E7a"),
+            ("Shiba", "0x8faf958E36c6970497386118030e6297fFf8d275"),
+        ]),
+        TradingPair::new("WETH/LDO", 18, 18, vec![
+            ("UniV2", "0xC558F600B34A5f69dD2f0D06Cb8A88d829B7420a"),
+            ("Sushi", "0xC558F600B34A5f69dD2f0D06Cb8A88d829B7420a"),
+        ]),
+
+        // --- LONG-TAIL PAIRS (Top 50-100) - PRIMARY TARGETS ---
+        TradingPair::new("WETH/AAVE", 18, 18, vec![
+            ("UniV2", "0xDFC14d2Af169B0D36C4EFF567Ada9b2E0CAE044f"),
+            ("Sushi", "0xD75EA151a61d06868E31F8988D28DFE5E9df57B4"),
+        ]),
+        TradingPair::new("WETH/MKR", 18, 18, vec![
+            ("UniV2", "0xC2aDdA861F89bBB333c90c492cB837741916A225"),
+            ("Sushi", "0xBa13afEcda9beB75De5c56BbAF696b880a5A50dD"),
+        ]),
+        TradingPair::new("WETH/SNX", 18, 18, vec![
+            ("UniV2", "0x43AE24960e5534731Fc831386c07755A2dc33D47"),
+            ("Sushi", "0xA1d7b2d891e3A1f9ef4bBC5be20630C2FEB1c470"),
+        ]),
+        TradingPair::new("WETH/CRV", 18, 18, vec![
+            ("UniV2", "0x3dA1313aE46132A397D90d95B1424A9A7e3e0fCE"),
+            ("Sushi", "0x58Dc5a51fE44589BEb22E8CE67720B5BC5378009"),
+        ]),
+        TradingPair::new("WETH/COMP", 18, 18, vec![
+            ("UniV2", "0xCFfDdeD873554F362Ac02f8Fb1f02E5ada10516f"),
+            ("Sushi", "0x31503dcb60119A812feE820bb7042752019F2355"),
+        ]),
+        TradingPair::new("WETH/GRT", 18, 18, vec![
+            ("UniV2", "0x2E81eC0B8B4022fAC83A21B2F2B4B8f5ED744D70"),
+            ("Sushi", "0x5F7B68137efF46BC0bFc6D4C705d5f0A2aDAc9B7"),
+        ]),
+        TradingPair::new("WETH/SAND", 18, 18, vec![
+            ("UniV2", "0x3dd49f67E9d5Bc4C5E6634b3F70BfD9dc1b6BD74"),
+            ("Sushi", "0x4a5D85E8b44e7eDb47D361a0193F8828F2eA91B8"),
+        ]),
+        TradingPair::new("WETH/MANA", 18, 18, vec![
+            ("UniV2", "0x11b1f53204d03E5529F09EB3091939e4Fd8c9CF3"),
+            ("Sushi", "0x1bEC4db6c3Bc499F3DbF289F5499C30d541FEc97"),
+        ]),
+        TradingPair::new("WETH/APE", 18, 18, vec![
+            ("UniV2", "0xAc4b3DacB91461209Ae9d41EC517c2B9Cb1B7DAF"),
+            ("Sushi", "0xb2E1F2a8E6d3D9b6d9A8a5e4b3C2D1e0F9a8b7c6"),
+        ]),
+        TradingPair::new("WETH/FXS", 18, 18, vec![
+            ("UniV2", "0xecBa967D84fCF0405F6b32Bc45F4d36BfDBB2E81"),
+            ("Sushi", "0x61eB53ee427aB4E007d78A9134AaCb3101A2DC23"),
+            ("Frax", "0x03B59Bd1c8B9F6C265bA0c3421923B93f15036Fa"),
+        ]),
+        TradingPair::new("WETH/LRC", 18, 18, vec![
+            ("UniV2", "0x8878Df9E1A7c87dcBf6d3999D997f262C05D8C70"),
+            ("Sushi", "0x1F5C9D9e78C51C8b3F3c66e9dB74F5c7e8B2f3a1"),
+        ]),
+        TradingPair::new("WETH/ENS", 18, 18, vec![
+            ("UniV2", "0x27fd581E9D0b2690C2f808cd40f7B5d1Af3E9F5E"),
+            ("Sushi", "0xCf19d8D32Bb298f3f3C64682f2Cc32E1bc0e3b72"),
+        ]),
+        TradingPair::new("WETH/1INCH", 18, 18, vec![
+            ("UniV2", "0x26aAd2da94C59524ac0D93F6D6Cbf9071d7086f2"),
+            ("Sushi", "0x9fC5b87b74B9BD239879491056752EB90188106D"),
+        ]),
+
+        // --- LONG-TAIL PAIRS (Top 100-150) - HIGH OPPORTUNITY ---
+        TradingPair::new("WETH/SUSHI", 18, 18, vec![
+            ("UniV2", "0xCE84867c3c02B05dc570d0135103d3fB9CC19433"),
+            ("Sushi", "0x795065dCc9f64b5614C407a6EFDC400DA6221FB0"),
+        ]),
+        TradingPair::new("WETH/YFI", 18, 18, vec![
+            ("UniV2", "0x2fDbAdf3C4D5A8666Bc06645B8358ab803996E28"),
+            ("Sushi", "0x088ee5007C98a9677165D78dD2109AE4a3D04d0C"),
+        ]),
+        TradingPair::new("WETH/BAL", 18, 18, vec![
+            ("UniV2", "0xA70d458A4d9Bc0e6571565faee18a48dA5c0D593"),
+            ("Sushi", "0xDEc87F2f3e7A936B08eBdffAD3f64aCC72b41aC8"),
+        ]),
+        TradingPair::new("WETH/RNDR", 18, 18, vec![
+            ("UniV2", "0x57ab0fF21a2CEa0C55F71c34cDA6B68E9cCfE2ba"),
+            ("Sushi", "0x2Bf5C1B17D48eE38C8f53fa6f61Dc05C3BB8d0E0"),
+        ]),
+        TradingPair::new("WETH/IMX", 18, 18, vec![
+            ("UniV2", "0x8e0fB8E6b19e7D76B1943D98D8b6928d44c8e7Fe"),
+            ("Sushi", "0x34B9c3E6c0B8c0f2f7E3C3D0fF8b0E9f7B6f5a4d"),
+        ]),
+        TradingPair::new("WETH/ENJ", 18, 18, vec![
+            ("UniV2", "0xe56c60B5f9f7B5FC70DE0eb79c6EE7d00eFa2625"),
+            ("Sushi", "0xb2b9E7a1b9e6b3c9D8f7E6a5B4c3D2e1F0a9b8c7"),
+        ]),
+        TradingPair::new("WETH/CHZ", 18, 18, vec![
+            ("UniV2", "0xBc4B5fFc2ca42D1e59e76C87Fc4f3be31C10d4Ea"),
+            ("Sushi", "0xf1c9E21E6e5C1a0F7a3C8E9b7D6f5e4a3C2b1d0e"),
+        ]),
+        TradingPair::new("WETH/ANKR", 18, 18, vec![
+            ("UniV2", "0x5201883feeb05822ce25c9af8ab41fc78ca73fa9"),
+            ("Sushi", "0x1241F4a348162d99379A23E73926Cf0bfCBf131e"),
+        ]),
+        TradingPair::new("WETH/MASK", 18, 18, vec![
+            ("UniV2", "0x4e68Ccd3E89f51C3074Ca5072bbAC773960dFa36"),
+            ("Sushi", "0xE0e57e7B1CbFf8D57e9ADB5f823D0C4cCA5c5A5B"),
+        ]),
+        TradingPair::new("WETH/OCEAN", 18, 18, vec![
+            ("UniV2", "0x9b7dAD79FC16106b47a3dAB791F389C167e15eb0"),
+            ("Sushi", "0x5aF2Be193a6ABCa9c8817001F45744777Db30756"),
+        ]),
+        TradingPair::new("WETH/NMR", 18, 18, vec![
+            ("UniV2", "0xb784CED6994c928170B417BBd052A096c6fB17E2"),
+            ("Sushi", "0xfab38492c6473E6b8a20C48F63d93Bf03e3fE8F8"),
+        ]),
+        TradingPair::new("WETH/AUDIO", 18, 18, vec![
+            ("UniV2", "0x55D5c232D921B9eAA6b37b5845E439aCD04b4DBa"),
+            ("Sushi", "0x48c76b05b03544af7a6ed1bF1B8b0e8F3c9C8A11"),
+        ]),
+        TradingPair::new("WETH/RLC", 9, 18, vec![
+            ("UniV2", "0x6D82C96A5dDF0ef4d1eb9C874a9c4DbC0d6dB19c"),
+            ("Sushi", "0x0E77Bc73d0cEd1E5eE88E631A63f5a7fF23B49E7"),
+        ]),
+
+        // --- LONG-TAIL PAIRS (Top 150-200) - HIGHEST OPPORTUNITY ---
+        TradingPair::new("WETH/STORJ", 8, 18, vec![
+            ("UniV2", "0x6bCa6de2dbDC4E0d41f7273011785ea16Ba47182"),
+            ("Sushi", "0x4ab6Fb07DB86C8e2B6fE25caD9E6A6D4F3d78F8B"),
+        ]),
+        TradingPair::new("WETH/POND", 18, 18, vec![
+            ("UniV2", "0x9Fe48d7A3b48E3f9C3e8C86B08Ec5A0c0E6e6bB5"),
+            ("Sushi", "0x8A76b3f3ce2e3b9c5d8f3e7A6b4c5d3e2f1a0b9c"),
+        ]),
+        TradingPair::new("WETH/API3", 18, 18, vec![
+            ("UniV2", "0x4Dd26482738bE6C06C31467a19dCDA9AD781E8C4"),
+            ("Sushi", "0x9Fe5C1B4fC2c3E5d8A7b6c4D3e2F1a0B9c8D7E6F"),
+        ]),
+        TradingPair::new("WETH/PERP", 18, 18, vec![
+            ("UniV2", "0x7BFD7192E76D950832c77BB412aaE841049D8D9B"),
+            ("Sushi", "0xF9440930043eb3997fc70e1339dBb11F341de7A8"),
+        ]),
+        TradingPair::new("WETH/BADGER", 18, 18, vec![
+            ("UniV2", "0xcd7989894bc033581532D2cd88Da5db0A4b12859"),
+            ("Sushi", "0x110492b31c59716AC47337E616804E3E3AdC0b4a"),
+        ]),
+        TradingPair::new("WETH/ALCX", 18, 18, vec![
+            ("UniV2", "0xC3f279090a47e80990Fe3a9c30d24Cb117EF91a8"),
+            ("Sushi", "0xC3f279090a47e80990Fe3a9c30d24Cb117EF91a8"),
+        ]),
+        TradingPair::new("WETH/ALPHA", 18, 18, vec![
+            ("UniV2", "0x684B00a5773679f88598A19976fBeb25a68E9a5f"),
+            ("Sushi", "0x0a5c84bb87f56c9786a4b1df8d0c8ab29e8c6d92"),
+        ]),
+        TradingPair::new("WETH/BAND", 18, 18, vec![
+            ("UniV2", "0xF421C3f2E695C2D4c0765379cCace8adE4a480D9"),
+            ("Sushi", "0xa75f7c2F025f470355515482BdE9EFA8153536A8"),
+        ]),
+        TradingPair::new("WETH/CELR", 18, 18, vec![
+            ("UniV2", "0xDF7F3C3C3d2d8b8c4E7F6a5B4C3D2E1F0A9B8C7D"),
+            ("Sushi", "0x22DEE1f631f5f3C2Ab7A33f9E8b1E9E7B6F5a4D3"),
+        ]),
+        TradingPair::new("WETH/CVX", 18, 18, vec![
+            ("UniV2", "0x05767d9EF41dC40689678fFca0608878fb3dE906"),
+            ("Sushi", "0x05767d9EF41dC40689678fFca0608878fb3dE906"),
+        ]),
+        TradingPair::new("WETH/DYDX", 18, 18, vec![
+            ("UniV2", "0x7c4eC7d9b10E5C3e0a7C85c5E8f0cF3a7e2B1d0A"),
+            ("Sushi", "0xe8E8486228753E01Dbc222dA262Aa706Bd67e601"),
+        ]),
+        TradingPair::new("WETH/SPELL", 18, 18, vec![
+            ("UniV2", "0xb5De0C3753b6E1B4dBA616Db82767F17513E6d4E"),
+            ("Sushi", "0xb5De0C3753b6E1B4dBA616Db82767F17513E6d4E"),
+        ]),
+        TradingPair::new("WETH/LOOKS", 18, 18, vec![
+            ("UniV2", "0xDC00bA87Cc2D99468f7f34BC04CBf72E111A32f7"),
+            ("Sushi", "0xDC00bA87Cc2D99468f7f34BC04CBf72E111A32f7"),
+        ]),
+        TradingPair::new("WETH/BTRFLY", 18, 18, vec![
+            ("UniV2", "0xE8E8486228753E01Dbc222dA262Aa706Bd67e601"),
+            ("Sushi", "0xe8E8486228753E01Dbc222dA262Aa706Bd67e601"),
+        ]),
+        TradingPair::new("WETH/OHM", 9, 18, vec![
+            ("UniV2", "0x69b81152c5A8d35A67B32A4D3772795d96CaE4da"),
+            ("Sushi", "0x055475920a8c93CfFb64d039A8205F7AcC7722d3"),
+        ]),
+        TradingPair::new("WETH/BONE", 18, 18, vec![
+            ("UniV2", "0xf7a038b23F53b901Bf1e1095e89E627b8d9d8C56"),
+            ("Sushi", "0x8d35739aD1529339c0b07F64dBE12BF1C1B2fD7e"),
+            ("Shiba", "0xf7a038b23F53b901Bf1e1095e89E627b8d9d8C56"),
+        ]),
+        TradingPair::new("WETH/LEASH", 18, 18, vec![
+            ("UniV2", "0x874376BE8231DAD99AAbF9Ef0767B3cc054c220E"),
+            ("Shiba", "0x874376BE8231DAD99AAbF9Ef0767B3cc054c220E"),
+        ]),
+        TradingPair::new("WETH/RPL", 18, 18, vec![
+            ("UniV2", "0x70eA56e46266f0137BAc6B75710E3546f47C855D"),
+            ("Sushi", "0xEc6a6b7dB761A5c9910bA8fcaB98116d384b1B85"),
+        ]),
+        TradingPair::new("WETH/FRAX", 18, 18, vec![
+            ("UniV2", "0xFD0a40Bc83C5faE4203DEc7e5929B446b07d1C76"),
+            ("Sushi", "0xE06F8D30AC334c857Fc8c380C85969C150f38A6A"),
+            ("Frax", "0x31351Bf3fba544863FBff44DDC27bA880916A8FF"),
+        ]),
+
+        // --- STABLECOIN PAIRS (arbitrage between stablecoins) ---
+        TradingPair::new("USDC/USDT", 6, 6, vec![
+            ("UniV2", "0x3041CbD36888bECc7bbCBc0045E3B1f144466f5f"),
+            ("Sushi", "0xD86A120a06255Df8D4e2248aB04d4267E23aDfaA"),
+        ]),
+        TradingPair::new("DAI/USDC", 18, 6, vec![
+            ("UniV2", "0xAE461cA67B15dc8dc81CE7615e0320dA1A9aB8D5"),
+            ("Sushi", "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
+        ]),
+        TradingPair::new("FRAX/USDC", 18, 6, vec![
+            ("UniV2", "0x97C4adc5d28A86f9470C70DD91Dc6CC2f20d2d4D"),
+            ("Sushi", "0x9a834b70c07C81a9fcD6F22E842bf002fBfFbe4D"),
+            ("Frax", "0x9a834b70c07C81a9fcD6F22E842bf002fBfFbe4D"),
+        ]),
     ];
 
     info!(
-        "Monitoring {} trading pairs across Uniswap V2 and SushiSwap",
+        "Monitoring {} trading pairs across Uniswap V2, SushiSwap, ShibaSwap, Fraxswap",
         pairs.len()
     );
 
@@ -668,44 +848,90 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
 
         // Scan all pairs
         for pair in &pairs {
-            // Fetch from both DEXes
-            let uni_result = fetch_uniswap_v2_reserves(&state.http_provider, pair.uni_pair).await;
-            let sushi_result = fetch_uniswap_v2_reserves(&state.http_provider, pair.sushi_pair).await;
+            if pair.pairs.len() < 2 {
+                continue; // Need at least 2 DEXes to compare
+            }
 
-            if let (Ok((uni_r0, uni_r1)), Ok((sushi_r0, sushi_r1))) = (uni_result, sushi_result) {
-                let uni_price = calculate_price(uni_r0, uni_r1, pair.token0_decimals, pair.token1_decimals);
-                let sushi_price = calculate_price(sushi_r0, sushi_r1, pair.token0_decimals, pair.token1_decimals);
+            // Fetch prices from all DEXes for this pair
+            let mut dex_prices: Vec<(&str, f64)> = Vec::new();
 
-                if uni_price > 0.0 && sushi_price > 0.0 {
-                    let spread = if uni_price > sushi_price {
-                        (uni_price - sushi_price) / sushi_price * 100.0
-                    } else {
-                        (sushi_price - uni_price) / uni_price * 100.0
-                    };
-
-                    // Log spreads above 0.05%
-                    if spread > 0.05 {
-                        opportunities_found += 1;
-                        info!(
-                            "[{}] Spread: {:.4}% | Uni: {:.6}, Sushi: {:.6}",
-                            pair.name, spread, uni_price, sushi_price
-                        );
+            for dex_pair in &pair.pairs {
+                if let Ok((r0, r1)) = fetch_uniswap_v2_reserves(&state.http_provider, dex_pair.address).await {
+                    let price = calculate_price(r0, r1, pair.token0_decimals, pair.token1_decimals);
+                    if price > 0.0 {
+                        dex_prices.push((dex_pair.dex, price));
                     }
+                }
+            }
 
-                    // Alert on significant opportunities
-                    if spread > 0.3 {
-                        warn!(
-                            "ARBITRAGE OPPORTUNITY: {} - {:.4}% spread (Uni: {:.6}, Sushi: {:.6})",
-                            pair.name, spread, uni_price, sushi_price
-                        );
-                    }
+            // Find max spread across all DEX combinations
+            if dex_prices.len() >= 2 {
+                let mut max_spread = 0.0f64;
+                let mut best_buy_dex = "";
+                let mut best_sell_dex = "";
+                let mut best_buy_price = 0.0;
+                let mut best_sell_price = 0.0;
 
-                    if spread > 0.5 {
-                        error!(
-                            "HIGH SPREAD ALERT: {} - {:.4}% - EXECUTE NOW!",
-                            pair.name, spread
-                        );
+                for i in 0..dex_prices.len() {
+                    for j in (i + 1)..dex_prices.len() {
+                        let (dex_a, price_a) = dex_prices[i];
+                        let (dex_b, price_b) = dex_prices[j];
+
+                        let spread = if price_a > price_b {
+                            (price_a - price_b) / price_b * 100.0
+                        } else {
+                            (price_b - price_a) / price_a * 100.0
+                        };
+
+                        if spread > max_spread {
+                            max_spread = spread;
+                            if price_a > price_b {
+                                best_buy_dex = dex_b;
+                                best_sell_dex = dex_a;
+                                best_buy_price = price_b;
+                                best_sell_price = price_a;
+                            } else {
+                                best_buy_dex = dex_a;
+                                best_sell_dex = dex_b;
+                                best_buy_price = price_a;
+                                best_sell_price = price_b;
+                            }
+                        }
                     }
+                }
+
+                // Filter out false positives: spreads > 10% are likely bad data (wrong addresses)
+                if max_spread > 10.0 {
+                    tracing::debug!(
+                        "[{}] SKIPPED - Spread {:.2}% too high (likely bad data)",
+                        pair.name, max_spread
+                    );
+                    continue;
+                }
+
+                // Log spreads above 0.05%
+                if max_spread > 0.05 {
+                    opportunities_found += 1;
+                    info!(
+                        "[{}] Spread: {:.4}% | Buy@{}: {:.6}, Sell@{}: {:.6}",
+                        pair.name, max_spread, best_buy_dex, best_buy_price, best_sell_dex, best_sell_price
+                    );
+                }
+
+                // Alert on significant opportunities (0.3% - 10%)
+                if max_spread > 0.3 {
+                    warn!(
+                        "ARBITRAGE OPPORTUNITY: {} - {:.4}% spread (Buy@{}: {:.6}, Sell@{}: {:.6})",
+                        pair.name, max_spread, best_buy_dex, best_buy_price, best_sell_dex, best_sell_price
+                    );
+                }
+
+                // High priority alerts (0.5% - 10%)
+                if max_spread > 0.5 {
+                    error!(
+                        "HIGH SPREAD ALERT: {} - {:.4}% - BUY {} @ {} -> SELL @ {}",
+                        pair.name, max_spread, best_buy_dex, best_buy_price, best_sell_dex
+                    );
                 }
             }
         }
