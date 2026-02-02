@@ -68,6 +68,9 @@ pub struct AppState {
 
     /// Real-time price cache updated by Swap events
     pub price_cache: Arc<DashMap<String, PriceUpdate>>,
+
+    /// Hot pools queue - pools with recent swap activity for priority scanning
+    pub hot_pools: Arc<DashMap<Address, chrono::DateTime<chrono::Utc>>>,
 }
 
 /// Real-time price data from Swap events
@@ -265,6 +268,7 @@ async fn async_main() -> Result<(), MevError> {
             last_block: std::sync::atomic::AtomicU64::new(0),
         }),
         price_cache: Arc::new(DashMap::new()),
+        hot_pools: Arc::new(DashMap::new()),
     });
 
     // Spawn monitoring tasks
@@ -2045,7 +2049,30 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
             // Fetch prices and liquidity from all DEXes for this pair
             let mut dex_prices: Vec<DexPriceData> = Vec::new();
 
+            // Check if any pool has recent swap activity (hot pool or price cache hit)
+            // This helps prioritize pairs with active trading
+            let mut is_hot_pair = false;
+            let cache_max_age = chrono::Duration::seconds(5);
+            let now = chrono::Utc::now();
+
             for dex_pair in &pair.pairs {
+                // Check hot pools queue first (populated by swap events)
+                if state.hot_pools.contains_key(&dex_pair.address) {
+                    is_hot_pair = true;
+                }
+
+                // Also check price cache for recent swap events (< 5 seconds old)
+                let cache_key = format!("{:?}", dex_pair.address);
+                if let Some(cached) = state.price_cache.get(&cache_key) {
+                    if now.signed_duration_since(cached.timestamp) < cache_max_age {
+                        is_hot_pair = true;
+                        tracing::trace!(
+                            "[{}] Cache hit for {} - recent swap at block {}",
+                            pair.name, dex_pair.dex, cached.block_number
+                        );
+                    }
+                }
+
                 // Use the unified fetch_dex_price_with_liquidity function that handles V2, V3, Curve, Balancer
                 match fetch_dex_price_with_liquidity(&*state.http_provider, dex_pair, pair.token0_decimals, pair.token1_decimals).await {
                     Ok(price_data) => {
@@ -2057,6 +2084,11 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                         tracing::trace!("Failed to fetch price for {}/{}: {}", pair.name, dex_pair.dex, e);
                     }
                 }
+            }
+
+            // Log when we detect a hot pair with recent swap activity
+            if is_hot_pair && dex_prices.len() >= 2 {
+                tracing::debug!("[{}] HOT PAIR - recent swap event detected, priority scanning", pair.name);
             }
 
             // Find max spread across all DEX combinations
@@ -2098,8 +2130,10 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                     continue;
                 }
 
-                // Only process spreads above 0.05%
-                if max_spread > 0.05 {
+                // Use lower threshold for hot pairs (0.03%) vs normal pairs (0.05%)
+                // Hot pairs have just had a swap, so price differences are more likely real
+                let min_spread = if is_hot_pair { 0.03 } else { 0.05 };
+                if max_spread > min_spread {
                     let buy_data = &dex_prices[best_buy_idx.unwrap()];
                     let sell_data = &dex_prices[best_sell_idx.unwrap()];
 
@@ -4293,10 +4327,18 @@ async fn run_swap_event_monitor(state: Arc<AppState>) -> Result<(), MevError> {
             timestamp: chrono::Utc::now(),
         });
 
+        // Add to hot pools queue for priority scanning
+        // This triggers immediate re-scan of pairs involving this pool
+        state.hot_pools.insert(pool_address, chrono::Utc::now());
+
+        // Clean up old hot pool entries (> 10 seconds old)
+        let cleanup_threshold = chrono::Utc::now() - chrono::Duration::seconds(10);
+        state.hot_pools.retain(|_, timestamp| *timestamp > cleanup_threshold);
+
         // Log significant swaps (> 1 ETH equivalent)
         if amount0.abs() > 1_000_000_000_000_000_000 || amount1.abs() > 1_000_000_000_000_000_000 {
             info!(
-                "Swap event: {} pool {:?} | amounts: {}/{} | price: {:.6} | block: {}",
+                "Swap event: {} pool {:?} | amounts: {}/{} | price: {:.6} | block: {} | HOT",
                 dex_type, pool_address, amount0, amount1, price, block_number
             );
         }
