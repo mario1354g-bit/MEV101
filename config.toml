@@ -5,11 +5,11 @@
 
 # Ethereum Network Configuration
 [ethereum]
-# HTTP RPC endpoint (env: ETH_RPC_URL)
-http_rpc_url = "http://localhost:8545"
+# HTTP RPC endpoint - Using Alchemy (higher rate limits)
+http_rpc_url = "https://eth-mainnet.g.alchemy.com/v2/4Lkxgt7ISPaJFuHh-_3vn"
 
-# WebSocket RPC endpoint for real-time subscriptions (env: ETH_WS_URL)
-ws_rpc_url = "ws://localhost:8546"
+# WebSocket RPC endpoint for real-time subscriptions
+ws_rpc_url = "wss://eth-mainnet.g.alchemy.com/v2/4Lkxgt7ISPaJFuHh-_3vn"
 
 # Chain ID: 1 = mainnet, 5 = goerli, 11155111 = sepolia (env: CHAIN_ID)
 chain_id = 1
@@ -78,7 +78,7 @@ token_blacklist = [
 max_gas_price_gwei = 500
 
 # Polling interval for HTTP provider in milliseconds
-poll_interval_ms = 100
+poll_interval_ms = 2000
 
 # Execution Configuration
 [execution]
