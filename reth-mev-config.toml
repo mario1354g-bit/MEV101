@@ -1,0 +1,191 @@
+# =============================================================================
+# RETH MEV-OPTIMIZED CONFIGURATION
+# =============================================================================
+# Save as: ~/.config/reth/reth.toml or pass with --config flag
+# Run with: reth node --config reth-mev-config.toml
+
+# =============================================================================
+# STAGES (Sync Configuration)
+# =============================================================================
+[stages]
+[stages.headers]
+downloader_max_concurrent_requests = 200
+downloader_min_concurrent_requests = 10
+downloader_max_buffered_responses = 200
+downloader_request_limit = 1000
+commit_threshold = 10000
+
+[stages.bodies]
+downloader_request_limit = 1000
+downloader_max_buffered_blocks_size_bytes = 2147483648  # 2GB buffer
+downloader_min_concurrent_requests = 10
+downloader_max_concurrent_requests = 200
+
+[stages.execution]
+max_blocks = 500000
+max_changes = 5000000
+max_cumulative_gas = 30000000000000  # 30T gas
+
+[stages.account_hashing]
+clean_threshold = 500000
+commit_threshold = 100000
+
+[stages.storage_hashing]
+clean_threshold = 500000
+commit_threshold = 100000
+
+[stages.merkle]
+clean_threshold = 50000
+
+# =============================================================================
+# TRANSACTION POOL (Critical for MEV)
+# =============================================================================
+[txpool]
+# Maximum pending transactions (increase for MEV)
+pending_max_count = 20000
+pending_max_size = 268435456  # 256 MB
+
+# Basefee pool
+basefee_max_count = 20000
+basefee_max_size = 268435456  # 256 MB
+
+# Queued transactions
+queued_max_count = 20000
+queued_max_size = 268435456  # 256 MB
+
+# Blob transactions (EIP-4844)
+blob_max_count = 1000
+blob_max_size = 268435456  # 256 MB
+
+# Transaction limits
+max_account_slots = 64  # Max txs per account
+price_bump = 10  # % price bump to replace tx
+
+# MEV: Keep transactions longer for analysis
+lifetime = 3600  # 1 hour (default: 30 min)
+
+# Local transactions (your bot's txs - never evict)
+local_transactions_config = "no_local"
+
+# Propagation - disable to avoid revealing your txs
+no_tx_gossip = false  # Set true if using Flashbots only
+
+# =============================================================================
+# NETWORK (P2P Optimization)
+# =============================================================================
+[network]
+# Maximum peers (more = faster propagation, more bandwidth)
+max_outbound_peers = 100
+max_inbound_peers = 50
+
+# Discovery
+discovery_v4 = true
+discovery_v5 = true
+
+# DNS discovery for faster initial sync
+dns_discovery = true
+
+# Trusted peers (add your own nodes/friends)
+# trusted_peers = [
+#     "enode://...",
+# ]
+
+# Static peers (always connect to these)
+# static_peers = [
+#     "enode://...",
+# ]
+
+# =============================================================================
+# RPC (API Configuration)
+# =============================================================================
+[rpc]
+# HTTP RPC
+http = true
+http_addr = "0.0.0.0"
+http_port = 8545
+http_api = ["eth", "net", "web3", "txpool", "debug", "trace", "reth"]
+http_corsdomain = "*"
+
+# WebSocket (Critical for MEV - real-time subscriptions)
+ws = true
+ws_addr = "0.0.0.0"
+ws_port = 8546
+ws_api = ["eth", "net", "web3", "txpool", "debug", "trace", "reth", "subscribe"]
+ws_origins = "*"
+
+# IPC (fastest, local only)
+ipc = true
+ipc_path = "/tmp/reth.ipc"
+
+# RPC limits (increase for heavy MEV usage)
+rpc_max_request_size = 52428800  # 50 MB
+rpc_max_response_size = 104857600  # 100 MB
+rpc_max_subscriptions_per_connection = 2048
+rpc_max_connections = 500
+rpc_max_tracing_requests = 50
+rpc_max_blocks_per_filter = 100000
+rpc_max_logs_per_response = 100000
+
+# Gas limit for eth_call (for simulation)
+rpc_gas_cap = 300000000  # 300M gas
+
+# =============================================================================
+# PRUNING (Balance speed vs disk space)
+# =============================================================================
+[prune]
+# Full node with recent state (good balance for MEV)
+block_interval = 5
+
+[prune.segments]
+# Keep all recent data (last 10000 blocks)
+sender_recovery = { distance = 10064 }
+transaction_lookup = { distance = 10064 }
+receipts = { distance = 10064 }
+account_history = { distance = 10064 }
+storage_history = { distance = 10064 }
+
+# For archive node (all history), comment above and use:
+# sender_recovery = "full"
+# transaction_lookup = "full"
+# receipts = "full"
+# account_history = "full"
+# storage_history = "full"
+
+# =============================================================================
+# DATABASE
+# =============================================================================
+[db]
+# Log threshold for slow queries (debug)
+log_level_slow_queries = 2000
+
+# Exclusive access (faster, prevents corruption)
+exclusive = true
+
+# =============================================================================
+# BUILDER (Block Building for MEV)
+# =============================================================================
+[builder]
+# Enable block building
+enabled = true
+
+# Extra data in blocks you build
+extradata = "mev-bot"
+
+# Gas limits
+gaslimit = 30000000
+
+# Interval to build new blocks (lower = more responsive)
+interval = 1  # seconds
+
+# Disable tx pool gossip when building privately
+disable_tx_pool_gossip = false
+
+# =============================================================================
+# DEBUG (Optional - Performance Monitoring)
+# =============================================================================
+[debug]
+# Enable debug APIs
+debug = true
+
+# Tracing
+trace = true

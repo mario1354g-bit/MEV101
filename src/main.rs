@@ -901,10 +901,15 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
             let mut dex_prices: Vec<(&str, f64)> = Vec::new();
 
             for dex_pair in &pair.pairs {
-                if let Ok((r0, r1)) = fetch_uniswap_v2_reserves(&state.http_provider, dex_pair.address).await {
-                    let price = calculate_price(r0, r1, pair.token0_decimals, pair.token1_decimals);
-                    if price > 0.0 {
-                        dex_prices.push((dex_pair.dex, price));
+                match fetch_uniswap_v2_reserves(&state.http_provider, dex_pair.address).await {
+                    Ok((r0, r1)) => {
+                        let price = calculate_price(r0, r1, pair.token0_decimals, pair.token1_decimals);
+                        if price > 0.0 {
+                            dex_prices.push((dex_pair.dex, price));
+                        }
+                    }
+                    Err(e) => {
+                        tracing::trace!("Failed to fetch reserves for {}/{}: {}", pair.name, dex_pair.dex, e);
                     }
                 }
             }
@@ -976,10 +981,22 @@ async fn run_dex_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                         status: if max_spread > 0.5 { "high_priority".to_string() } else { "detected".to_string() },
                     });
 
-                    // Keep only last 100 opportunities
-                    while state.opportunities.len() > 100 {
-                        if let Some(oldest) = state.opportunities.iter().next() {
-                            state.opportunities.remove(oldest.key());
+                    // Keep only last 500 opportunities and remove stale ones (>5 min old)
+                    let now = chrono::Utc::now();
+                    let stale_keys: Vec<String> = state.opportunities
+                        .iter()
+                        .filter(|entry| {
+                            now.signed_duration_since(entry.value().detected_at).num_seconds() > 300
+                        })
+                        .map(|entry| entry.key().clone())
+                        .collect();
+                    for key in stale_keys {
+                        state.opportunities.remove(&key);
+                    }
+                    // Hard cap at 500
+                    while state.opportunities.len() > 500 {
+                        if let Some(entry) = state.opportunities.iter().next() {
+                            state.opportunities.remove(entry.key());
                         }
                     }
                 }

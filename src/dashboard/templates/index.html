@@ -3,702 +3,684 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>MEV Monitor Dashboard</title>
-    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/water.css@2/out/water.css">
+    <title>MEV Monitor</title>
     <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
         :root {
-            --profit-color: #22c55e;
-            --loss-color: #ef4444;
-            --pending-color: #f59e0b;
-            --neutral-color: #6b7280;
+            --bg: #0c0c0f;
+            --card: #141419;
+            --card-hover: #1a1a21;
+            --border: #2a2a35;
+            --text: #e4e4e7;
+            --text-dim: #71717a;
+            --green: #22c55e;
+            --green-dim: rgba(34, 197, 94, 0.15);
+            --red: #ef4444;
+            --red-dim: rgba(239, 68, 68, 0.15);
+            --blue: #3b82f6;
+            --blue-dim: rgba(59, 130, 246, 0.15);
+            --yellow: #eab308;
+            --yellow-dim: rgba(234, 179, 8, 0.15);
+            --purple: #a855f7;
+            --purple-dim: rgba(168, 85, 247, 0.15);
         }
 
         body {
-            max-width: 1400px;
-            padding: 1rem;
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+            font-size: 14px;
         }
 
+        .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
+
+        /* Header */
         header {
             display: flex;
             justify-content: space-between;
             align-items: center;
-            margin-bottom: 2rem;
-            flex-wrap: wrap;
-            gap: 1rem;
+            margin-bottom: 24px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
         }
 
-        header h1 {
-            margin: 0;
-        }
-
-        .status-indicator {
+        .title {
+            font-size: 20px;
+            font-weight: 600;
             display: flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: 10px;
         }
 
-        .status-dot {
-            width: 10px;
-            height: 10px;
+        .title-dot {
+            width: 8px;
+            height: 8px;
+            background: var(--green);
             border-radius: 50%;
-            background: var(--profit-color);
             animation: pulse 2s infinite;
         }
 
         @keyframes pulse {
             0%, 100% { opacity: 1; }
-            50% { opacity: 0.5; }
+            50% { opacity: 0.4; }
         }
 
-        /* Stats Cards */
-        .stats-grid {
+        .header-stats {
+            display: flex;
+            gap: 24px;
+            font-size: 13px;
+            color: var(--text-dim);
+        }
+
+        .header-stats strong { color: var(--text); }
+
+        /* Stats Grid */
+        .stats {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
-            gap: 1rem;
-            margin-bottom: 2rem;
+            grid-template-columns: repeat(6, 1fr);
+            gap: 12px;
+            margin-bottom: 24px;
         }
 
-        .stat-card {
-            background: var(--background-body);
+        @media (max-width: 1200px) {
+            .stats { grid-template-columns: repeat(3, 1fr); }
+        }
+
+        @media (max-width: 600px) {
+            .stats { grid-template-columns: repeat(2, 1fr); }
+        }
+
+        .stat {
+            background: var(--card);
             border: 1px solid var(--border);
             border-radius: 8px;
-            padding: 1rem;
+            padding: 16px;
         }
 
-        .stat-card h3 {
-            margin: 0 0 0.5rem 0;
-            font-size: 0.875rem;
-            color: var(--text-muted);
+        .stat-label {
+            font-size: 11px;
             text-transform: uppercase;
-            letter-spacing: 0.05em;
+            letter-spacing: 0.5px;
+            color: var(--text-dim);
+            margin-bottom: 4px;
         }
 
-        .stat-card .value {
-            font-size: 1.5rem;
-            font-weight: bold;
+        .stat-value {
+            font-size: 24px;
+            font-weight: 600;
         }
 
-        .stat-card .sub-value {
-            font-size: 0.875rem;
-            color: var(--text-muted);
+        .stat-value.green { color: var(--green); }
+        .stat-value.red { color: var(--red); }
+
+        .stat-sub {
+            font-size: 12px;
+            color: var(--text-dim);
+            margin-top: 2px;
         }
 
-        .profit { color: var(--profit-color); }
-        .loss { color: var(--loss-color); }
-        .pending { color: var(--pending-color); }
+        /* Main Grid */
+        .main {
+            display: grid;
+            grid-template-columns: 1fr 320px;
+            gap: 16px;
+        }
 
-        /* Filters */
-        .filters {
-            display: flex;
-            flex-wrap: wrap;
-            gap: 1rem;
-            margin-bottom: 1.5rem;
-            padding: 1rem;
-            background: var(--background-body);
+        @media (max-width: 1000px) {
+            .main { grid-template-columns: 1fr; }
+        }
+
+        /* Card */
+        .card {
+            background: var(--card);
             border: 1px solid var(--border);
             border-radius: 8px;
+            overflow: hidden;
         }
 
-        .filters label {
-            display: flex;
-            flex-direction: column;
-            gap: 0.25rem;
-            font-size: 0.875rem;
-        }
-
-        .filters select,
-        .filters input {
-            padding: 0.5rem;
-            min-width: 150px;
-        }
-
-        .filters button {
-            align-self: flex-end;
-        }
-
-        /* Table */
-        .table-container {
-            overflow-x: auto;
-            margin-bottom: 2rem;
-        }
-
-        table {
-            width: 100%;
-            border-collapse: collapse;
-            font-size: 0.875rem;
-        }
-
-        th {
-            text-align: left;
-            background: var(--background-alt);
-            position: sticky;
-            top: 0;
-        }
-
-        th, td {
-            padding: 0.75rem;
+        .card-header {
+            padding: 12px 16px;
             border-bottom: 1px solid var(--border);
-        }
-
-        tr:hover {
-            background: var(--background-alt);
-        }
-
-        .badge {
-            display: inline-block;
-            padding: 0.25rem 0.5rem;
-            border-radius: 4px;
-            font-size: 0.75rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
             font-weight: 500;
         }
 
-        .badge-type {
-            background: #3b82f6;
-            color: white;
+        .card-header span { color: var(--text-dim); font-weight: 400; font-size: 13px; }
+
+        /* Table */
+        .table-wrap { overflow-x: auto; max-height: 520px; overflow-y: auto; }
+
+        table { width: 100%; border-collapse: collapse; font-size: 13px; }
+
+        th {
+            text-align: left;
+            padding: 10px 12px;
+            font-size: 11px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+            color: var(--text-dim);
+            font-weight: 500;
+            background: var(--card);
+            position: sticky;
+            top: 0;
+            border-bottom: 1px solid var(--border);
         }
 
-        .badge-simulated {
-            background: #8b5cf6;
-            color: white;
+        td {
+            padding: 10px 12px;
+            border-bottom: 1px solid var(--border);
+            vertical-align: middle;
         }
 
-        .badge-executed {
-            background: var(--profit-color);
-            color: white;
-        }
+        tr:hover { background: var(--card-hover); }
 
-        .badge-competitor {
-            background: var(--loss-color);
-            color: white;
-        }
-
-        /* Hourly Heatmap */
-        .heatmap-section {
-            margin-bottom: 2rem;
-        }
-
-        .heatmap {
-            display: flex;
-            gap: 4px;
-            padding: 1rem;
-            background: var(--background-body);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            overflow-x: auto;
-        }
-
-        .heatmap-hour {
-            display: flex;
-            flex-direction: column;
+        /* Type Badges */
+        .type-badge {
+            display: inline-flex;
             align-items: center;
-            gap: 4px;
-        }
-
-        .heatmap-cell {
-            width: 32px;
-            height: 32px;
+            gap: 5px;
+            padding: 3px 8px;
             border-radius: 4px;
+            font-size: 11px;
+            font-weight: 500;
+        }
+
+        .type-arb { background: var(--green-dim); color: var(--green); }
+        .type-sandwich { background: var(--purple-dim); color: var(--purple); }
+        .type-liquidation { background: var(--red-dim); color: var(--red); }
+        .type-backrun { background: var(--blue-dim); color: var(--blue); }
+        .type-frontrun { background: var(--yellow-dim); color: var(--yellow); }
+
+        /* Status */
+        .status {
+            display: inline-flex;
+            align-items: center;
+            gap: 4px;
+            font-size: 11px;
+        }
+
+        .status-dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+        }
+
+        .status-live .status-dot { background: var(--green); }
+        .status-simulated .status-dot { background: var(--blue); }
+        .status-failed .status-dot { background: var(--red); }
+        .status-pending .status-dot { background: var(--yellow); }
+
+        /* Profit */
+        .profit { font-weight: 600; font-family: 'SF Mono', Monaco, monospace; }
+        .profit.positive { color: var(--green); }
+        .profit.negative { color: var(--red); }
+
+        /* Pair */
+        .pair { font-weight: 500; }
+        .pair-route { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+        /* Sidebar */
+        .sidebar-card { margin-bottom: 16px; }
+
+        .alert-list { padding: 8px; max-height: 280px; overflow-y: auto; }
+
+        .alert-item {
+            display: flex;
+            gap: 10px;
+            padding: 10px;
+            border-radius: 6px;
+            margin-bottom: 6px;
+            background: var(--card-hover);
+            border-left: 3px solid var(--green);
+        }
+
+        .alert-icon { font-size: 18px; }
+
+        .alert-content { flex: 1; min-width: 0; }
+
+        .alert-title {
+            font-weight: 500;
+            font-size: 13px;
+            display: flex;
+            justify-content: space-between;
+        }
+
+        .alert-profit { color: var(--green); font-family: 'SF Mono', Monaco, monospace; }
+
+        .alert-detail { font-size: 11px; color: var(--text-dim); margin-top: 2px; }
+
+        /* Simulation Banner */
+        .sim-banner {
+            background: var(--yellow-dim);
+            border: 1px solid rgba(234, 179, 8, 0.3);
+            border-radius: 6px;
+            padding: 12px 16px;
+            margin-bottom: 16px;
             display: flex;
             align-items: center;
-            justify-content: center;
-            font-size: 0.625rem;
-            color: white;
-            cursor: pointer;
+            gap: 10px;
+            font-size: 13px;
         }
 
-        .heatmap-label {
-            font-size: 0.75rem;
-            color: var(--text-muted);
-        }
+        .sim-banner-icon { font-size: 18px; }
+        .sim-banner strong { color: var(--yellow); }
 
-        /* Type Analysis */
-        .analysis-grid {
+        /* Charts */
+        .chart-grid {
             display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-            gap: 1rem;
-            margin-bottom: 2rem;
+            grid-template-columns: 1fr 1fr;
+            gap: 16px;
+            margin-top: 16px;
         }
 
-        .analysis-card {
-            background: var(--background-body);
-            border: 1px solid var(--border);
-            border-radius: 8px;
-            padding: 1rem;
+        @media (max-width: 800px) {
+            .chart-grid { grid-template-columns: 1fr; }
         }
 
-        .analysis-card h3 {
-            margin-top: 0;
-        }
+        .bar-chart { padding: 12px; }
 
-        .bar-chart {
-            display: flex;
-            flex-direction: column;
-            gap: 0.5rem;
-        }
-
-        .bar-row {
+        .bar-item {
             display: flex;
             align-items: center;
-            gap: 0.5rem;
+            gap: 8px;
+            margin-bottom: 8px;
         }
 
         .bar-label {
-            width: 120px;
-            font-size: 0.75rem;
+            width: 80px;
+            font-size: 11px;
+            color: var(--text-dim);
+            white-space: nowrap;
             overflow: hidden;
             text-overflow: ellipsis;
-            white-space: nowrap;
         }
 
         .bar-track {
             flex: 1;
             height: 20px;
-            background: var(--background-alt);
+            background: var(--bg);
             border-radius: 4px;
             overflow: hidden;
         }
 
         .bar-fill {
             height: 100%;
-            background: #3b82f6;
             border-radius: 4px;
             display: flex;
             align-items: center;
             justify-content: flex-end;
-            padding-right: 0.5rem;
-            font-size: 0.625rem;
+            padding-right: 6px;
+            font-size: 10px;
+            font-weight: 500;
             color: white;
-            min-width: fit-content;
+            transition: width 0.3s;
         }
 
-        /* Pagination */
-        .pagination {
-            display: flex;
-            justify-content: center;
-            gap: 0.5rem;
-            margin-top: 1rem;
-        }
+        .bar-fill.green { background: var(--green); }
+        .bar-fill.blue { background: var(--blue); }
 
-        .pagination button {
-            padding: 0.5rem 1rem;
-        }
-
-        /* Footer */
-        footer {
-            margin-top: 2rem;
-            padding-top: 1rem;
-            border-top: 1px solid var(--border);
+        /* Empty State */
+        .empty {
             text-align: center;
-            color: var(--text-muted);
-            font-size: 0.875rem;
+            padding: 40px;
+            color: var(--text-dim);
         }
 
-        .loading {
-            text-align: center;
-            padding: 2rem;
-            color: var(--text-muted);
-        }
+        .empty-icon { font-size: 32px; margin-bottom: 8px; }
 
-        .error {
-            color: var(--loss-color);
-            padding: 1rem;
-            background: rgba(239, 68, 68, 0.1);
-            border-radius: 8px;
-            margin-bottom: 1rem;
-        }
-
-        .tx-hash {
-            font-family: monospace;
-            font-size: 0.75rem;
-        }
-
-        .tx-hash a {
-            color: inherit;
-        }
+        /* Scrollbar */
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: var(--bg); }
+        ::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+        ::-webkit-scrollbar-thumb:hover { background: var(--text-dim); }
     </style>
 </head>
 <body>
-    <header>
-        <h1>MEV Monitor Dashboard</h1>
-        <div class="status-indicator">
-            <span class="status-dot"></span>
-            <span id="last-update">Loading...</span>
+    <div class="container">
+        <header>
+            <div class="title">
+                <span class="title-dot"></span>
+                MEV Monitor
+            </div>
+            <div class="header-stats">
+                <div>Block <strong id="block">-</strong></div>
+                <div>Updated <strong id="updated">-</strong></div>
+                <div>Chain <strong id="chain">ETH</strong></div>
+            </div>
+        </header>
+
+        <!-- Simulation Banner -->
+        <div class="sim-banner" id="sim-banner">
+            <span class="sim-banner-icon">⏳</span>
+            <div>
+                <strong>Simulation Pending</strong> — Local reth node syncing. Opportunities shown are unverified.
+                Profit estimates may differ from actual execution results.
+            </div>
         </div>
-    </header>
 
-    <main>
-        <!-- Stats Section -->
-        <section id="stats-section">
-            <div class="stats-grid" id="stats-grid">
-                <div class="stat-card">
-                    <h3>Total Opportunities</h3>
-                    <div class="value" id="stat-total">-</div>
-                    <div class="sub-value"><span id="stat-24h">-</span> in 24h</div>
+        <!-- Stats -->
+        <div class="stats">
+            <div class="stat">
+                <div class="stat-label">Active</div>
+                <div class="stat-value green" id="s-active">-</div>
+                <div class="stat-sub">opportunities</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Est. Profit</div>
+                <div class="stat-value green" id="s-profit">-</div>
+                <div class="stat-sub">if executed</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">High Priority</div>
+                <div class="stat-value" id="s-high">-</div>
+                <div class="stat-sub">&gt;0.5% spread</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Simulated</div>
+                <div class="stat-value" id="s-simulated">0</div>
+                <div class="stat-sub">verified</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Would Fail</div>
+                <div class="stat-value red" id="s-failed">-</div>
+                <div class="stat-sub">simulation failed</div>
+            </div>
+            <div class="stat">
+                <div class="stat-label">Pools</div>
+                <div class="stat-value" id="s-pools">57</div>
+                <div class="stat-sub">monitored</div>
+            </div>
+        </div>
+
+        <!-- Main Content -->
+        <div class="main">
+            <div class="card">
+                <div class="card-header">
+                    Opportunities <span id="opp-count">0 found</span>
                 </div>
-                <div class="stat-card">
-                    <h3>Estimated Profit</h3>
-                    <div class="value profit" id="stat-estimated-profit">-</div>
-                    <div class="sub-value">Total estimated</div>
-                </div>
-                <div class="stat-card">
-                    <h3>Executed Profit</h3>
-                    <div class="value profit" id="stat-executed-profit">-</div>
-                    <div class="sub-value"><span id="stat-executed-count">-</span> executions</div>
-                </div>
-                <div class="stat-card">
-                    <h3>Simulated</h3>
-                    <div class="value" id="stat-simulated">-</div>
-                    <div class="sub-value">opportunities simulated</div>
-                </div>
-                <div class="stat-card">
-                    <h3>Competitor Captured</h3>
-                    <div class="value loss" id="stat-competitor">-</div>
-                    <div class="sub-value">missed opportunities</div>
-                </div>
-                <div class="stat-card">
-                    <h3>Active Pools</h3>
-                    <div class="value" id="stat-pools">-</div>
-                    <div class="sub-value">being monitored</div>
+                <div class="table-wrap">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Type</th>
+                                <th>Pair</th>
+                                <th>Est. Profit</th>
+                                <th>Spread</th>
+                                <th>Status</th>
+                                <th>Age</th>
+                            </tr>
+                        </thead>
+                        <tbody id="opp-table">
+                            <tr><td colspan="6" class="empty">
+                                <div class="empty-icon">📡</div>
+                                Scanning for opportunities...
+                            </td></tr>
+                        </tbody>
+                    </table>
                 </div>
             </div>
-        </section>
 
-        <!-- Hourly Heatmap -->
-        <section class="heatmap-section">
-            <h2>Opportunity Distribution (Last 7 Days, UTC)</h2>
-            <div class="heatmap" id="heatmap">
-                <div class="loading">Loading heatmap...</div>
-            </div>
-        </section>
+            <div>
+                <!-- High Priority Alerts -->
+                <div class="card sidebar-card">
+                    <div class="card-header">High Priority</div>
+                    <div class="alert-list" id="alerts">
+                        <div class="empty">
+                            <div class="empty-icon">🔍</div>
+                            Waiting for &gt;0.5% spreads...
+                        </div>
+                    </div>
+                </div>
 
-        <!-- Analysis Section -->
-        <section class="analysis-grid">
-            <div class="analysis-card">
-                <h3>By Opportunity Type</h3>
-                <div class="bar-chart" id="type-chart">
-                    <div class="loading">Loading...</div>
+                <!-- Type Breakdown -->
+                <div class="card sidebar-card">
+                    <div class="card-header">By Type</div>
+                    <div class="bar-chart" id="type-chart">
+                        <div class="empty">No data</div>
+                    </div>
                 </div>
             </div>
-            <div class="analysis-card">
-                <h3>Top Token Pairs</h3>
+        </div>
+
+        <!-- Charts -->
+        <div class="chart-grid">
+            <div class="card">
+                <div class="card-header">Top Pairs</div>
                 <div class="bar-chart" id="pair-chart">
-                    <div class="loading">Loading...</div>
+                    <div class="empty">Loading...</div>
                 </div>
             </div>
-        </section>
-
-        <!-- Filters -->
-        <section>
-            <h2>Recent Opportunities</h2>
-            <div class="filters">
-                <label>
-                    Type
-                    <select id="filter-type">
-                        <option value="">All Types</option>
-                        <option value="price_discrepancy">Price Discrepancy</option>
-                        <option value="multi_hop">Multi-Hop</option>
-                        <option value="sandwich">Sandwich</option>
-                        <option value="backrun">Backrun</option>
-                        <option value="liquidation">Liquidation</option>
-                        <option value="liquidity_event">Liquidity Event</option>
-                    </select>
-                </label>
-                <label>
-                    Status
-                    <select id="filter-status">
-                        <option value="">All</option>
-                        <option value="simulated">Simulated</option>
-                        <option value="executed">Executed</option>
-                    </select>
-                </label>
-                <label>
-                    Min Profit (ETH)
-                    <input type="number" id="filter-min-profit" step="0.001" placeholder="0.01">
-                </label>
-                <label>
-                    Token Pair
-                    <input type="text" id="filter-pair" placeholder="e.g., WETH/USDC">
-                </label>
-                <button onclick="applyFilters()">Apply Filters</button>
-                <button onclick="resetFilters()">Reset</button>
+            <div class="card">
+                <div class="card-header">Best Spreads</div>
+                <div class="bar-chart" id="spread-chart">
+                    <div class="empty">Loading...</div>
+                </div>
             </div>
-        </section>
-
-        <!-- Opportunities Table -->
-        <section>
-            <div class="table-container">
-                <table>
-                    <thead>
-                        <tr>
-                            <th>ID</th>
-                            <th>Time</th>
-                            <th>Type</th>
-                            <th>Token Pairs</th>
-                            <th>Est. Profit (ETH)</th>
-                            <th>Block</th>
-                            <th>Status</th>
-                            <th>Actions</th>
-                        </tr>
-                    </thead>
-                    <tbody id="opportunities-table">
-                        <tr><td colspan="8" class="loading">Loading opportunities...</td></tr>
-                    </tbody>
-                </table>
-            </div>
-            <div class="pagination">
-                <button id="prev-page" onclick="prevPage()" disabled>Previous</button>
-                <span id="page-info">Page 1</span>
-                <button id="next-page" onclick="nextPage()">Next</button>
-            </div>
-        </section>
-    </main>
-
-    <footer>
-        <p>MEV Monitor Dashboard | Auto-refreshes every 30 seconds</p>
-    </footer>
+        </div>
+    </div>
 
     <script>
-        // State
-        let currentPage = 0;
-        const pageSize = 50;
-        let currentFilters = {};
+        const ETH_PRICE = 2500; // Approximate ETH price for USD estimates
+        let alerts = [];
+        let bestSpreads = {};
 
-        // Initialize
-        document.addEventListener('DOMContentLoaded', () => {
-            loadStats();
-            loadHeatmap();
-            loadTypeAnalysis();
-            loadPairAnalysis();
-            loadOpportunities();
-
-            // Auto-refresh every 30 seconds
-            setInterval(() => {
-                loadStats();
-                loadOpportunities();
-            }, 30000);
-        });
-
-        // API calls
-        async function fetchApi(endpoint) {
+        async function fetchApi(url) {
             try {
-                const response = await fetch(endpoint);
-                if (!response.ok) {
-                    throw new Error(`HTTP ${response.status}`);
+                const res = await fetch(url);
+                return res.ok ? await res.json() : null;
+            } catch { return null; }
+        }
+
+        function formatTime(iso) {
+            const diff = (Date.now() - new Date(iso)) / 1000;
+            if (diff < 60) return `${Math.floor(diff)}s`;
+            if (diff < 3600) return `${Math.floor(diff / 60)}m`;
+            return `${Math.floor(diff / 3600)}h`;
+        }
+
+        function getPair(target) {
+            if (!target) return { pair: 'Unknown', route: '' };
+            const match = target.match(/^([A-Z]+\/[A-Z]+)/);
+            const pair = match ? match[1] : target.split(' ')[0];
+            const parts = target.split(' ');
+            const route = parts.length > 2 ? `${parts[1]} ${parts[2]} → ${parts[3] || ''} ${parts[4] || ''}`.trim() : '';
+            return { pair, route };
+        }
+
+        function getType(opp) {
+            // Determine opportunity type from data
+            const target = opp.target_tx || '';
+            if (target.includes('Buy@') && target.includes('Sell@')) return { type: 'ARB', label: 'Arbitrage', class: 'type-arb' };
+            if (opp.opportunity_type === 'sandwich') return { type: 'SAND', label: 'Sandwich', class: 'type-sandwich' };
+            if (opp.opportunity_type === 'liquidation') return { type: 'LIQ', label: 'Liquidation', class: 'type-liquidation' };
+            if (opp.opportunity_type === 'backrun') return { type: 'BACK', label: 'Backrun', class: 'type-backrun' };
+            return { type: 'ARB', label: 'Arbitrage', class: 'type-arb' };
+        }
+
+        function calcProfit(opp) {
+            // Calculate estimated profit based on spread and typical flash loan size
+            const spread = parseFloat(opp.estimated_profit_wei || opp.net_profit_wei || '0');
+            const flashLoanSize = 100; // 100 ETH flash loan
+            const ethProfit = (spread / 100) * flashLoanSize;
+            const usdProfit = ethProfit * ETH_PRICE;
+            return { eth: ethProfit, usd: usdProfit, spread };
+        }
+
+        function getStatus(opp) {
+            if (opp.simulated && opp.simulation_failed) return { label: 'Failed', class: 'status-failed' };
+            if (opp.simulated) return { label: 'Verified', class: 'status-simulated' };
+            if (opp.status === 'high_priority') return { label: 'Live', class: 'status-live' };
+            return { label: 'Pending', class: 'status-pending' };
+        }
+
+        async function loadData() {
+            const [opps, status, stats] = await Promise.all([
+                fetchApi('/api/opportunities'),
+                fetchApi('/api/status'),
+                fetchApi('/api/stats')
+            ]);
+
+            // Update header
+            if (status) {
+                document.getElementById('block').textContent = status.current_block?.toLocaleString() || '-';
+                document.getElementById('chain').textContent = status.chain_id === 1 ? 'ETH' : `Chain ${status.chain_id}`;
+            }
+            document.getElementById('updated').textContent = new Date().toLocaleTimeString();
+
+            if (!opps) return;
+
+            const opportunities = opps.opportunities || [];
+            const count = opps.count || 0;
+
+            // Sort by profit
+            const sorted = [...opportunities].sort((a, b) => {
+                const profitA = calcProfit(a).eth;
+                const profitB = calcProfit(b).eth;
+                return profitB - profitA;
+            });
+
+            // Calculate totals
+            let totalProfit = 0;
+            let highCount = 0;
+            let simulated = 0;
+            let failed = 0;
+            const typeCounts = {};
+            const pairCounts = {};
+
+            sorted.forEach(opp => {
+                const profit = calcProfit(opp);
+                totalProfit += profit.eth;
+                if (opp.status === 'high_priority') highCount++;
+                if (opp.simulated) simulated++;
+                if (opp.simulation_failed) failed++;
+
+                const typeInfo = getType(opp);
+                typeCounts[typeInfo.label] = (typeCounts[typeInfo.label] || 0) + 1;
+
+                const { pair } = getPair(opp.target_tx);
+                pairCounts[pair] = (pairCounts[pair] || 0) + 1;
+
+                // Track best spreads
+                if (!bestSpreads[pair] || profit.spread > bestSpreads[pair].spread) {
+                    bestSpreads[pair] = { spread: profit.spread, time: opp.detected_at };
                 }
-                return await response.json();
-            } catch (error) {
-                console.error(`API error: ${endpoint}`, error);
-                return null;
+            });
+
+            // Update stats
+            document.getElementById('s-active').textContent = count;
+            document.getElementById('s-profit').textContent = `$${Math.round(totalProfit * ETH_PRICE).toLocaleString()}`;
+            document.getElementById('s-high').textContent = highCount;
+            document.getElementById('s-simulated').textContent = simulated;
+            document.getElementById('s-failed').textContent = failed > 0 ? failed : '-';
+            document.getElementById('s-pools').textContent = stats?.active_pools || 57;
+            document.getElementById('opp-count').textContent = `${count} found`;
+
+            // Update alerts
+            const highPriority = sorted.filter(o => o.status === 'high_priority').slice(0, 5);
+            if (highPriority.length > 0) {
+                document.getElementById('alerts').innerHTML = highPriority.map(opp => {
+                    const { pair, route } = getPair(opp.target_tx);
+                    const profit = calcProfit(opp);
+                    return `
+                        <div class="alert-item">
+                            <div class="alert-icon">💰</div>
+                            <div class="alert-content">
+                                <div class="alert-title">
+                                    <span>${pair}</span>
+                                    <span class="alert-profit">+$${Math.round(profit.usd).toLocaleString()}</span>
+                                </div>
+                                <div class="alert-detail">${route} • ${profit.spread.toFixed(2)}% spread</div>
+                            </div>
+                        </div>
+                    `;
+                }).join('');
             }
-        }
 
-        // Load statistics
-        async function loadStats() {
-            const stats = await fetchApi('/api/stats');
-            if (!stats) return;
-
-            document.getElementById('stat-total').textContent = stats.total_opportunities.toLocaleString();
-            document.getElementById('stat-24h').textContent = stats.opportunities_24h.toLocaleString();
-            document.getElementById('stat-estimated-profit').textContent = formatEth(stats.total_estimated_profit_eth);
-            document.getElementById('stat-executed-profit').textContent = formatEth(stats.total_execution_profit_eth);
-            document.getElementById('stat-executed-count').textContent = stats.executed_count.toLocaleString();
-            document.getElementById('stat-simulated').textContent = stats.simulated_count.toLocaleString();
-            document.getElementById('stat-competitor').textContent = stats.competitor_captured_count.toLocaleString();
-            document.getElementById('stat-pools').textContent = stats.active_pools.toLocaleString();
-
-            document.getElementById('last-update').textContent = `Last updated: ${new Date().toLocaleTimeString()}`;
-        }
-
-        // Load hourly heatmap
-        async function loadHeatmap() {
-            const data = await fetchApi('/api/analysis/hourly');
-            if (!data) return;
-
-            const container = document.getElementById('heatmap');
-            container.innerHTML = '';
-
-            data.hours.forEach(hour => {
-                const div = document.createElement('div');
-                div.className = 'heatmap-hour';
-
-                const intensity = hour.intensity;
-                const color = intensity > 0
-                    ? `rgba(59, 130, 246, ${0.2 + intensity * 0.8})`
-                    : 'var(--background-alt)';
-
-                div.innerHTML = `
-                    <div class="heatmap-cell" style="background: ${color}" title="${hour.count} opportunities, ${formatEth(hour.total_profit_eth)} profit">
-                        ${hour.count > 0 ? hour.count : ''}
+            // Update type chart
+            const typeEntries = Object.entries(typeCounts).sort((a, b) => b[1] - a[1]);
+            const maxType = Math.max(...typeEntries.map(([_, c]) => c), 1);
+            if (typeEntries.length > 0) {
+                document.getElementById('type-chart').innerHTML = typeEntries.map(([type, count]) => `
+                    <div class="bar-item">
+                        <span class="bar-label">${type}</span>
+                        <div class="bar-track">
+                            <div class="bar-fill blue" style="width: ${(count / maxType * 100)}%">${count}</div>
+                        </div>
                     </div>
-                    <span class="heatmap-label">${String(hour.hour).padStart(2, '0')}</span>
+                `).join('');
+            }
+
+            // Update pair chart
+            const pairEntries = Object.entries(pairCounts).sort((a, b) => b[1] - a[1]).slice(0, 6);
+            const maxPair = Math.max(...pairEntries.map(([_, c]) => c), 1);
+            if (pairEntries.length > 0) {
+                document.getElementById('pair-chart').innerHTML = pairEntries.map(([pair, count]) => `
+                    <div class="bar-item">
+                        <span class="bar-label">${pair}</span>
+                        <div class="bar-track">
+                            <div class="bar-fill blue" style="width: ${(count / maxPair * 100)}%">${count}</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            // Update spread chart
+            const spreadEntries = Object.entries(bestSpreads).sort((a, b) => b[1].spread - a[1].spread).slice(0, 6);
+            const maxSpread = Math.max(...spreadEntries.map(([_, d]) => d.spread), 0.1);
+            if (spreadEntries.length > 0) {
+                document.getElementById('spread-chart').innerHTML = spreadEntries.map(([pair, data]) => `
+                    <div class="bar-item">
+                        <span class="bar-label">${pair}</span>
+                        <div class="bar-track">
+                            <div class="bar-fill green" style="width: ${(data.spread / maxSpread * 100)}%">${data.spread.toFixed(2)}%</div>
+                        </div>
+                    </div>
+                `).join('');
+            }
+
+            // Update table
+            if (sorted.length === 0) {
+                document.getElementById('opp-table').innerHTML = `
+                    <tr><td colspan="6" class="empty">
+                        <div class="empty-icon">📡</div>
+                        Scanning for opportunities...
+                    </td></tr>
                 `;
-                container.appendChild(div);
-            });
-        }
-
-        // Load type analysis
-        async function loadTypeAnalysis() {
-            const data = await fetchApi('/api/analysis/by-type');
-            if (!data) return;
-
-            const container = document.getElementById('type-chart');
-            if (data.types.length === 0) {
-                container.innerHTML = '<p>No data available</p>';
                 return;
             }
 
-            const maxCount = Math.max(...data.types.map(t => t.count));
-            container.innerHTML = data.types.map(type => `
-                <div class="bar-row">
-                    <span class="bar-label" title="${type.opportunity_type}">${formatTypeName(type.opportunity_type)}</span>
-                    <div class="bar-track">
-                        <div class="bar-fill" style="width: ${(type.count / maxCount * 100)}%">
-                            ${type.count} (${type.percentage.toFixed(1)}%)
-                        </div>
-                    </div>
-                </div>
-            `).join('');
+            document.getElementById('opp-table').innerHTML = sorted.slice(0, 50).map(opp => {
+                const typeInfo = getType(opp);
+                const { pair, route } = getPair(opp.target_tx);
+                const profit = calcProfit(opp);
+                const status = getStatus(opp);
+
+                return `
+                    <tr>
+                        <td><span class="type-badge ${typeInfo.class}">${typeInfo.type}</span></td>
+                        <td>
+                            <div class="pair">${pair}</div>
+                            <div class="pair-route">${route}</div>
+                        </td>
+                        <td>
+                            <div class="profit positive">+$${Math.round(profit.usd).toLocaleString()}</div>
+                            <div style="font-size:11px;color:var(--text-dim)">${profit.eth.toFixed(4)} ETH</div>
+                        </td>
+                        <td><span class="profit ${profit.spread >= 0.5 ? 'positive' : ''}">${profit.spread.toFixed(2)}%</span></td>
+                        <td><span class="status ${status.class}"><span class="status-dot"></span>${status.label}</span></td>
+                        <td style="color:var(--text-dim)">${formatTime(opp.detected_at)}</td>
+                    </tr>
+                `;
+            }).join('');
         }
 
-        // Load pair analysis
-        async function loadPairAnalysis() {
-            const data = await fetchApi('/api/analysis/by-pair');
-            if (!data) return;
-
-            const container = document.getElementById('pair-chart');
-            if (data.pairs.length === 0) {
-                container.innerHTML = '<p>No data available</p>';
-                return;
-            }
-
-            const topPairs = data.pairs.slice(0, 8);
-            const maxCount = Math.max(...topPairs.map(p => p.count));
-
-            container.innerHTML = topPairs.map(pair => `
-                <div class="bar-row">
-                    <span class="bar-label" title="${pair.token_pair}">${pair.token_pair || 'Unknown'}</span>
-                    <div class="bar-track">
-                        <div class="bar-fill" style="width: ${(pair.count / maxCount * 100)}%">
-                            ${pair.count}
-                        </div>
-                    </div>
-                </div>
-            `).join('');
-        }
-
-        // Load opportunities
-        async function loadOpportunities() {
-            const params = new URLSearchParams({
-                limit: pageSize,
-                offset: currentPage * pageSize,
-                ...currentFilters
-            });
-
-            const opportunities = await fetchApi(`/api/opportunities?${params}`);
-            if (!opportunities) return;
-
-            const tbody = document.getElementById('opportunities-table');
-
-            if (opportunities.length === 0) {
-                tbody.innerHTML = '<tr><td colspan="8" class="loading">No opportunities found</td></tr>';
-                return;
-            }
-
-            tbody.innerHTML = opportunities.map(opp => `
-                <tr>
-                    <td>${opp.id}</td>
-                    <td title="${opp.timestamp_formatted}">${formatTimeAgo(opp.timestamp)}</td>
-                    <td><span class="badge badge-type">${formatTypeName(opp.opportunity_type)}</span></td>
-                    <td>${opp.token_pairs.join(', ') || '-'}</td>
-                    <td class="${opp.estimated_net_profit_eth >= 0 ? 'profit' : 'loss'}">
-                        ${formatEth(opp.estimated_net_profit_eth)}
-                    </td>
-                    <td>${opp.block_number_detected.toLocaleString()}</td>
-                    <td>
-                        ${opp.simulated ? '<span class="badge badge-simulated">Sim</span>' : ''}
-                        ${opp.executed ? '<span class="badge badge-executed">Exec</span>' : ''}
-                        ${opp.captured_by_competitor ? '<span class="badge badge-competitor">Comp</span>' : ''}
-                    </td>
-                    <td>
-                        <a href="/opportunity/${opp.id}">Details</a>
-                    </td>
-                </tr>
-            `).join('');
-
-            // Update pagination
-            document.getElementById('page-info').textContent = `Page ${currentPage + 1}`;
-            document.getElementById('prev-page').disabled = currentPage === 0;
-            document.getElementById('next-page').disabled = opportunities.length < pageSize;
-        }
-
-        // Pagination
-        function prevPage() {
-            if (currentPage > 0) {
-                currentPage--;
-                loadOpportunities();
-            }
-        }
-
-        function nextPage() {
-            currentPage++;
-            loadOpportunities();
-        }
-
-        // Filters
-        function applyFilters() {
-            currentFilters = {};
-            currentPage = 0;
-
-            const type = document.getElementById('filter-type').value;
-            if (type) currentFilters.opportunity_type = type;
-
-            const status = document.getElementById('filter-status').value;
-            if (status === 'simulated') currentFilters.simulated = true;
-            if (status === 'executed') currentFilters.executed = true;
-
-            const minProfit = document.getElementById('filter-min-profit').value;
-            if (minProfit) currentFilters.min_profit_eth = parseFloat(minProfit);
-
-            const pair = document.getElementById('filter-pair').value;
-            if (pair) currentFilters.token_pair = pair;
-
-            loadOpportunities();
-        }
-
-        function resetFilters() {
-            document.getElementById('filter-type').value = '';
-            document.getElementById('filter-status').value = '';
-            document.getElementById('filter-min-profit').value = '';
-            document.getElementById('filter-pair').value = '';
-            currentFilters = {};
-            currentPage = 0;
-            loadOpportunities();
-        }
-
-        // Formatting helpers
-        function formatEth(value) {
-            if (value === null || value === undefined) return '-';
-            if (Math.abs(value) < 0.0001) return '< 0.0001 ETH';
-            return value.toFixed(4) + ' ETH';
-        }
-
-        function formatTypeName(type) {
-            if (!type) return 'Unknown';
-            return type.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-        }
-
-        function formatTimeAgo(timestamp) {
-            const seconds = Math.floor((Date.now() - timestamp) / 1000);
-            if (seconds < 60) return `${seconds}s ago`;
-            if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
-            if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
-            return `${Math.floor(seconds / 86400)}d ago`;
-        }
-
-        function formatTxHash(hash) {
-            if (!hash) return '-';
-            return hash.substring(0, 10) + '...' + hash.substring(hash.length - 8);
-        }
+        // Init
+        loadData();
+        setInterval(loadData, 5000);
     </script>
 </body>
 </html>
