@@ -1,13 +1,14 @@
 //! Mempool collector - monitors pending transactions
 
 use crate::artemis::{Collector, Event, PendingTxEvent};
-use alloy::primitives::B256;
+use alloy::eips::eip2718::Encodable2718;
+use alloy::primitives::{Bytes, B256};
 use alloy::providers::{Provider, ProviderBuilder, WsConnect};
 use async_trait::async_trait;
 use futures::StreamExt;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 
 /// Mempool collector configuration
 #[derive(Debug, Clone)]
@@ -64,9 +65,15 @@ impl Collector for MempoolCollector {
                 tokio::spawn(async move {
                     match provider.get_transaction_by_hash(tx_hash).await {
                         Ok(Some(tx)) => {
-                            debug!("MempoolCollector: Sending pending tx event for {:?}", tx_hash);
+                            // Encode transaction to raw RLP bytes for Flashbots bundles
+                            let mut raw_bytes = Vec::new();
+                            tx.inner.encode_2718(&mut raw_bytes);
+                            let raw_tx = Bytes::from(raw_bytes);
+
+                            debug!("MempoolCollector: Sending pending tx event for {:?} ({} bytes)", tx_hash, raw_tx.len());
                             let event = Event::PendingTx(PendingTxEvent {
                                 tx,
+                                raw_tx,
                                 received_at: chrono::Utc::now(),
                             });
                             if sender.send(event).await.is_err() {
@@ -126,8 +133,14 @@ impl Collector for HighFreqMempoolCollector {
             // Fetch every transaction in parallel
             tokio::spawn(async move {
                 if let Ok(Some(tx)) = provider.get_transaction_by_hash(tx_hash).await {
+                    // Encode transaction to raw RLP bytes for Flashbots bundles
+                    let mut raw_bytes = Vec::new();
+                    tx.inner.encode_2718(&mut raw_bytes);
+                    let raw_tx = Bytes::from(raw_bytes);
+
                     let event = Event::PendingTx(PendingTxEvent {
                         tx,
+                        raw_tx,
                         received_at: chrono::Utc::now(),
                     });
                     let _ = sender.send(event).await;

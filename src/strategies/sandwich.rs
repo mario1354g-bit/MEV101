@@ -680,6 +680,7 @@ impl SandwichStrategy {
         Some(SandwichAction {
             id,
             target_tx: alloy::primitives::B256::ZERO, // Set by caller
+            target_tx_raw: Bytes::new(), // Set by caller with raw victim tx bytes
             frontrun: SandwichTx {
                 pool: Address::ZERO,
                 token_in: swap.token_in,
@@ -772,6 +773,7 @@ impl Strategy for SandwichStrategy {
                     // Evaluate for sandwich (async - uses REVM simulation)
                     if let Some(mut action) = self.evaluate_target(&swap).await {
                         action.target_tx = tx_hash;
+                        action.target_tx_raw = pending.raw_tx.clone(); // Include raw bytes for Flashbots bundle
                         return Ok(Some(Action::Sandwich(action)));
                     }
                 }

@@ -3,7 +3,7 @@
 //! This module defines the event and action types that flow through
 //! the Collector -> Strategy -> Executor pipeline.
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::rpc::types::Transaction;
 use serde::{Deserialize, Serialize};
 
@@ -26,6 +26,8 @@ pub enum Event {
 #[derive(Debug, Clone)]
 pub struct PendingTxEvent {
     pub tx: Transaction,
+    /// Raw RLP-encoded transaction bytes (for Flashbots bundle inclusion)
+    pub raw_tx: Bytes,
     pub received_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -163,6 +165,8 @@ pub struct SwapStep {
 pub struct SandwichAction {
     pub id: String,
     pub target_tx: B256,
+    /// Raw RLP-encoded victim transaction bytes (required for Flashbots bundle)
+    pub target_tx_raw: Bytes,
     pub frontrun: SandwichTx,
     pub backrun: SandwichTx,
     pub expected_profit: U256,

@@ -101,7 +101,7 @@ pub async fn run_artemis(
     engine.run().await
 }
 
-/// Create default trading pairs for arbitrage
+/// Create default trading pairs for arbitrage - HOT POOLS
 fn create_default_pairs() -> Vec<DexPair> {
     use crate::artemis::DexType;
 
@@ -134,10 +134,15 @@ fn create_default_pairs() -> Vec<DexPair> {
         symbol: "DAI".to_string(),
         decimals: 18,
     };
-    let _ = dai; // Suppress unused warning
+
+    let aave = TokenInfo {
+        address: address!("7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"),
+        symbol: "AAVE".to_string(),
+        decimals: 18,
+    };
 
     vec![
-        // WETH/USDC pairs
+        // ========== USDC/WETH pools (highest volume) ==========
         DexPair {
             pool: address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"),
             dex: DexType::UniswapV2,
@@ -150,7 +155,14 @@ fn create_default_pairs() -> Vec<DexPair> {
             dex: DexType::UniswapV3,
             token0: usdc.clone(),
             token1: weth.clone(),
-            fee_bps: 5,
+            fee_bps: 5, // 0.05%
+        },
+        DexPair {
+            pool: address!("8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"),
+            dex: DexType::UniswapV3,
+            token0: usdc.clone(),
+            token1: weth.clone(),
+            fee_bps: 30, // 0.3%
         },
         DexPair {
             pool: address!("397FF1542f962076d0BFE58eA045FfA2d347ACa0"),
@@ -159,7 +171,8 @@ fn create_default_pairs() -> Vec<DexPair> {
             token1: weth.clone(),
             fee_bps: 30,
         },
-        // WETH/USDT pairs
+
+        // ========== WETH/USDT pools ==========
         DexPair {
             pool: address!("0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"),
             dex: DexType::UniswapV2,
@@ -172,21 +185,70 @@ fn create_default_pairs() -> Vec<DexPair> {
             dex: DexType::UniswapV3,
             token0: weth.clone(),
             token1: usdt.clone(),
-            fee_bps: 5,
+            fee_bps: 5, // 0.05%
         },
-        // WBTC/WETH pairs
+        DexPair {
+            pool: address!("4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"),
+            dex: DexType::UniswapV3,
+            token0: weth.clone(),
+            token1: usdt.clone(),
+            fee_bps: 30, // 0.3%
+        },
+
+        // ========== WBTC/WETH pools ==========
+        DexPair {
+            pool: address!("4585FE77225b41b697C938B018E2Ac67Ac5a20c0"),
+            dex: DexType::UniswapV3,
+            token0: wbtc.clone(),
+            token1: weth.clone(),
+            fee_bps: 5, // 0.05%
+        },
         DexPair {
             pool: address!("Cbcdf9626bC03E24f779434178A73a0B4bad62eD"),
             dex: DexType::UniswapV3,
             token0: wbtc.clone(),
             token1: weth.clone(),
-            fee_bps: 30,
+            fee_bps: 30, // 0.3%
         },
         DexPair {
             pool: address!("CEfF51756c56CeFFCA006cD410B03FFC46dd3a58"),
             dex: DexType::SushiSwap,
             token0: wbtc.clone(),
             token1: weth.clone(),
+            fee_bps: 30,
+        },
+
+        // ========== WBTC/USDT pool ==========
+        DexPair {
+            pool: address!("9Db9e0e53058C89e5B94e29621a205198648425B"),
+            dex: DexType::UniswapV3,
+            token0: wbtc.clone(),
+            token1: usdt.clone(),
+            fee_bps: 30, // 0.3%
+        },
+
+        // ========== AAVE pools ==========
+        DexPair {
+            pool: address!("5aB53EE1d50eeF2C1DD3d5402789cd27bB52c1bB"),
+            dex: DexType::UniswapV3,
+            token0: aave.clone(),
+            token1: weth.clone(),
+            fee_bps: 30, // 0.3%
+        },
+
+        // ========== DAI/USDC/USDT (stablecoin arb) ==========
+        DexPair {
+            pool: address!("6c6Bc977E13Df9b0de53b251522280BB72383700"),
+            dex: DexType::UniswapV3,
+            token0: dai.clone(),
+            token1: usdc.clone(),
+            fee_bps: 1, // 0.01%
+        },
+        DexPair {
+            pool: address!("AE461cA67B15dc8dc81CE7615e0320dA1A9aB8D5"),
+            dex: DexType::UniswapV2,
+            token0: dai.clone(),
+            token1: usdc.clone(),
             fee_bps: 30,
         },
     ]

@@ -4,10 +4,14 @@ use crate::artemis::{
     Action, ArbitrageAction, ExecutionResult, Executor, LiquidationAction, SandwichAction,
 };
 use crate::simulation::{RevmSimulator, RevmTransaction};
-use alloy::network::EthereumWallet;
-use alloy::primitives::{Address, B256, Bytes, U256};
+use alloy::consensus::SignableTransaction;
+use alloy::eips::eip2718::Encodable2718;
+use alloy::network::{EthereumWallet, TransactionBuilder};
+use alloy::primitives::{address, Address, B256, Bytes, U256, keccak256};
 use alloy::providers::{Provider, ProviderBuilder};
+use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
+use alloy::signers::Signer;
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use reqwest::Client;
@@ -275,12 +279,15 @@ impl FlashbotsExecutor {
         Ok((all_success, total_gas, estimated_profit))
     }
 
-    /// Submit bundle to Flashbots relay
+    /// Submit bundle to Flashbots relay with proper signing
     async fn submit_bundle(
         &self,
         txs: Vec<String>,
         target_block: u64,
     ) -> eyre::Result<BundleResult> {
+        let signer = self.signer.as_ref()
+            .ok_or_else(|| eyre::eyre!("No signer configured"))?;
+
         let bundle = FlashbotsBundle {
             txs,
             block_number: format!("0x{:x}", target_block),
@@ -295,15 +302,50 @@ impl FlashbotsExecutor {
             params: vec![bundle],
         };
 
-        // Sign request with Flashbots auth signer
+        // Serialize request body
+        let body = serde_json::to_string(&request)?;
+
+        // Sign the request body hash for Flashbots authentication
+        // Flashbots expects EIP-191 personal sign: sign("\x19Ethereum Signed Message:\n" + len + keccak256(body))
+        let body_hash = keccak256(body.as_bytes());
+
+        // Use sign_message which adds the Ethereum message prefix (EIP-191)
+        let signature = signer.sign_message(body_hash.as_slice()).await?;
+
+        // Format: address:signature (65 bytes: r[32] + s[32] + v[1])
+        let sig_bytes = signature.as_bytes();
+        let sig_header = format!(
+            "{}:0x{}",
+            signer.address(),
+            hex::encode(sig_bytes)
+        );
+
+        debug!(
+            target_block = target_block,
+            sig_header = %sig_header,
+            "Submitting signed bundle to Flashbots"
+        );
+
         let response = self
             .client
             .post(&self.config.relay_url)
-            .json(&request)
+            .header("Content-Type", "application/json")
+            .header("X-Flashbots-Signature", &sig_header)
+            .body(body)
             .send()
             .await?;
 
-        let bundle_response: BundleResponse = response.json().await?;
+        let status = response.status();
+        let response_text = response.text().await?;
+
+        debug!(status = %status, response = %response_text, "Flashbots response");
+
+        if !status.is_success() {
+            return Err(eyre::eyre!("Flashbots HTTP error {}: {}", status, response_text));
+        }
+
+        let bundle_response: BundleResponse = serde_json::from_str(&response_text)
+            .map_err(|e| eyre::eyre!("Failed to parse response: {} - body: {}", e, response_text))?;
 
         if let Some(error) = bundle_response.error {
             return Err(eyre::eyre!("Flashbots error: {}", error.message));
@@ -312,6 +354,127 @@ impl FlashbotsExecutor {
         bundle_response
             .result
             .ok_or_else(|| eyre::eyre!("No result in Flashbots response"))
+    }
+
+    /// Build flashloan arbitrage transaction
+    async fn build_flashloan_arb_tx(
+        &self,
+        arb: &ArbitrageAction,
+        nonce: u64,
+        gas_price: u128,
+        max_priority_fee: u128,
+    ) -> eyre::Result<String> {
+        let signer = self.signer.as_ref()
+            .ok_or_else(|| eyre::eyre!("No signer configured"))?;
+
+        // Encode executeBalancerFlashloan call
+        // Function: executeBalancerFlashloan(address[] tokens, uint256[] amounts, bytes swapData)
+        // Extract token from first step in path, or use input_token
+        let flash_token = arb.flashloan_token.unwrap_or(arb.input_token);
+        let flash_amount = arb.flashloan_amount.unwrap_or(arb.input_amount);
+        let calldata = encode_flashloan_arb(flash_token, flash_amount);
+
+        let tx = TransactionRequest::default()
+            .with_to(self.config.flashloan_contract)
+            .with_nonce(nonce)
+            .with_chain_id(1)
+            .with_gas_limit(500_000)
+            .with_max_fee_per_gas(gas_price + max_priority_fee)
+            .with_max_priority_fee_per_gas(max_priority_fee)
+            .with_input(calldata);
+
+        let wallet = EthereumWallet::from(signer.clone());
+        let signed = tx.build(&wallet).await?;
+
+        // Encode the signed transaction using RLP
+        let mut encoded = Vec::new();
+        signed.encode_2718(&mut encoded);
+        let raw_tx = hex::encode(&encoded);
+        Ok(format!("0x{}", raw_tx))
+    }
+
+    /// Build liquidation transaction
+    async fn build_liquidation_tx(
+        &self,
+        liq: &LiquidationAction,
+        nonce: u64,
+        gas_price: u128,
+        max_priority_fee: u128,
+    ) -> eyre::Result<String> {
+        let signer = self.signer.as_ref()
+            .ok_or_else(|| eyre::eyre!("No signer configured"))?;
+
+        // Encode liquidation call (simplified)
+        let calldata = Bytes::new(); // Would encode actual liquidation params
+
+        let tx = TransactionRequest::default()
+            .with_to(self.config.flashloan_contract)
+            .with_nonce(nonce)
+            .with_chain_id(1)
+            .with_gas_limit(800_000)
+            .with_max_fee_per_gas(gas_price + max_priority_fee)
+            .with_max_priority_fee_per_gas(max_priority_fee)
+            .with_input(calldata);
+
+        let wallet = EthereumWallet::from(signer.clone());
+        let signed = tx.build(&wallet).await?;
+
+        let mut encoded = Vec::new();
+        signed.encode_2718(&mut encoded);
+        let raw_tx = hex::encode(&encoded);
+        Ok(format!("0x{}", raw_tx))
+    }
+
+    /// Build and sign a swap transaction
+    async fn build_signed_swap_tx(
+        &self,
+        pool: Address,
+        token_in: Address,
+        token_out: Address,
+        amount_in: U256,
+        min_amount_out: U256,
+        nonce: u64,
+        gas_price: u128,
+        max_priority_fee: u128,
+    ) -> eyre::Result<String> {
+        let signer = self.signer.as_ref()
+            .ok_or_else(|| eyre::eyre!("No signer configured"))?;
+
+        // Encode Uniswap V3 exactInputSingle call
+        // Function: exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
+        let fee: u32 = 3000; // 0.3% fee tier
+        let sqrt_price_limit = U256::ZERO;
+
+        // ABI encode the swap params
+        let calldata = encode_exact_input_single(
+            token_in,
+            token_out,
+            fee,
+            signer.address(),
+            amount_in,
+            min_amount_out,
+            sqrt_price_limit,
+        );
+
+        // Build EIP-1559 transaction
+        let tx = TransactionRequest::default()
+            .with_to(pool)
+            .with_nonce(nonce)
+            .with_chain_id(1)
+            .with_gas_limit(300_000)
+            .with_max_fee_per_gas(gas_price)
+            .with_max_priority_fee_per_gas(max_priority_fee)
+            .with_input(calldata);
+
+        // Sign transaction
+        let wallet = EthereumWallet::from(signer.clone());
+        let signed = tx.build(&wallet).await?;
+
+        // Encode to raw transaction hex
+        let mut encoded = Vec::new();
+        signed.encode_2718(&mut encoded);
+        let raw_tx = hex::encode(&encoded);
+        Ok(format!("0x{}", raw_tx))
     }
 }
 
@@ -394,24 +557,96 @@ impl Executor for FlashbotsExecutor {
             return Ok(sim_result);
         }
 
-        // Get current block for bundle targeting
+        let signer = self.signer.as_ref()
+            .ok_or_else(|| eyre::eyre!("No signer configured"))?;
+
+        // Get current block and gas prices
         let provider = ProviderBuilder::new().on_http(self.config.rpc_url.parse()?);
         let current_block = provider.get_block_number().await?;
         let target_block = current_block + 1;
 
-        let (action_id, profit) = match &action {
-            Action::Arbitrage(arb) => (arb.id.clone(), arb.expected_profit),
-            Action::Sandwich(sandwich) => (sandwich.id.clone(), sandwich.expected_profit),
-            Action::Liquidation(liq) => (liq.id.clone(), liq.expected_profit),
-            Action::Backrun(backrun) => (backrun.id.clone(), backrun.arb.expected_profit),
-        };
+        // Get nonce and gas prices
+        let nonce = provider.get_transaction_count(signer.address()).await?;
+        let gas_price = provider.get_gas_price().await?;
+        let max_priority_fee = 3_000_000_000u128; // 3 gwei priority fee
 
-        // Build signed transactions (placeholder - would need actual signing)
-        let signed_txs: Vec<String> = vec![];
+        let (action_id, profit, signed_txs) = match &action {
+            Action::Sandwich(sandwich) => {
+                // Verify we have raw victim transaction bytes
+                if sandwich.target_tx_raw.is_empty() {
+                    warn!("Sandwich {} has no raw victim tx bytes", sandwich.id);
+                    return Ok(ExecutionResult::Failed {
+                        action_id: sandwich.id.clone(),
+                        reason: "No raw victim transaction bytes available".to_string(),
+                    });
+                }
+
+                info!(
+                    "Building sandwich bundle for {} - victim tx: {} ({} bytes)",
+                    sandwich.id,
+                    sandwich.target_tx,
+                    sandwich.target_tx_raw.len()
+                );
+
+                // Determine target pool - use Uniswap V3 SwapRouter
+                let swap_router = address!("E592427A0AEce92De3Edee1F18E0157C05861564");
+
+                // Build frontrun transaction (buy tokens before victim)
+                let frontrun_tx = self.build_signed_swap_tx(
+                    swap_router,
+                    sandwich.frontrun.token_in,
+                    sandwich.frontrun.token_out,
+                    sandwich.frontrun.amount_in,
+                    sandwich.frontrun.min_amount_out,
+                    nonce,
+                    gas_price,
+                    max_priority_fee,
+                ).await?;
+
+                // Victim transaction (raw bytes already encoded)
+                let victim_tx = format!("0x{}", hex::encode(&sandwich.target_tx_raw));
+
+                // Build backrun transaction (sell tokens after victim)
+                let backrun_tx = self.build_signed_swap_tx(
+                    swap_router,
+                    sandwich.backrun.token_in,
+                    sandwich.backrun.token_out,
+                    sandwich.backrun.amount_in,
+                    sandwich.backrun.min_amount_out,
+                    nonce + 1, // Increment nonce for backrun
+                    gas_price,
+                    max_priority_fee,
+                ).await?;
+
+                info!(
+                    "Sandwich bundle: frontrun={} bytes, victim={} bytes, backrun={} bytes",
+                    frontrun_tx.len(),
+                    victim_tx.len(),
+                    backrun_tx.len()
+                );
+
+                // Bundle order: [frontrun, victim, backrun]
+                (sandwich.id.clone(), sandwich.expected_profit, vec![frontrun_tx, victim_tx, backrun_tx])
+            }
+            Action::Arbitrage(arb) => {
+                // Build arbitrage transaction using flashloan contract
+                let arb_tx = self.build_flashloan_arb_tx(arb, nonce, gas_price, max_priority_fee).await?;
+                (arb.id.clone(), arb.expected_profit, vec![arb_tx])
+            }
+            Action::Liquidation(liq) => {
+                let liq_tx = self.build_liquidation_tx(liq, nonce, gas_price, max_priority_fee).await?;
+                (liq.id.clone(), liq.expected_profit, vec![liq_tx])
+            }
+            Action::Backrun(backrun) => {
+                let arb_tx = self.build_flashloan_arb_tx(&backrun.arb, nonce, gas_price, max_priority_fee).await?;
+                (backrun.id.clone(), backrun.arb.expected_profit, vec![arb_tx])
+            }
+        };
 
         info!(
             action = %action_id,
             target_block = target_block,
+            num_txs = signed_txs.len(),
             "Submitting bundle to Flashbots"
         );
 
@@ -437,4 +672,88 @@ impl Executor for FlashbotsExecutor {
             }
         }
     }
+}
+
+/// Encode Uniswap V3 exactInputSingle function call
+fn encode_exact_input_single(
+    token_in: Address,
+    token_out: Address,
+    fee: u32,
+    recipient: Address,
+    amount_in: U256,
+    min_amount_out: U256,
+    sqrt_price_limit: U256,
+) -> Bytes {
+    // Function selector for exactInputSingle((address,address,uint24,address,uint256,uint256,uint160))
+    // = 0x414bf389
+    let selector = [0x41, 0x4b, 0xf3, 0x89];
+
+    let mut calldata = Vec::with_capacity(260);
+    calldata.extend_from_slice(&selector);
+
+    // Encode struct as tuple
+    // tokenIn (address)
+    calldata.extend_from_slice(&[0u8; 12]);
+    calldata.extend_from_slice(token_in.as_slice());
+
+    // tokenOut (address)
+    calldata.extend_from_slice(&[0u8; 12]);
+    calldata.extend_from_slice(token_out.as_slice());
+
+    // fee (uint24) - padded to 32 bytes
+    let mut fee_bytes = [0u8; 32];
+    fee_bytes[29..32].copy_from_slice(&fee.to_be_bytes()[1..4]);
+    calldata.extend_from_slice(&fee_bytes);
+
+    // recipient (address)
+    calldata.extend_from_slice(&[0u8; 12]);
+    calldata.extend_from_slice(recipient.as_slice());
+
+    // amountIn (uint256)
+    calldata.extend_from_slice(&amount_in.to_be_bytes::<32>());
+
+    // amountOutMinimum (uint256)
+    calldata.extend_from_slice(&min_amount_out.to_be_bytes::<32>());
+
+    // sqrtPriceLimitX96 (uint160) - padded to 32 bytes
+    calldata.extend_from_slice(&sqrt_price_limit.to_be_bytes::<32>());
+
+    Bytes::from(calldata)
+}
+
+/// Encode flashloan arbitrage call
+fn encode_flashloan_arb(token: Address, amount: U256) -> Bytes {
+    // Function: executeBalancerFlashloan(address[] tokens, uint256[] amounts, bytes swapData)
+    // Selector = keccak256("executeBalancerFlashloan(address[],uint256[],bytes)")[:4]
+    let selector = [0x5c, 0x38, 0x44, 0x9e]; // Computed selector
+
+    let mut calldata = Vec::with_capacity(512);
+    calldata.extend_from_slice(&selector);
+
+    // Offset to tokens array (3 * 32 = 96)
+    calldata.extend_from_slice(&U256::from(96).to_be_bytes::<32>());
+
+    // Offset to amounts array (96 + 32 + 32 = 160)
+    calldata.extend_from_slice(&U256::from(160).to_be_bytes::<32>());
+
+    // Offset to swapData (160 + 32 + 32 = 224)
+    calldata.extend_from_slice(&U256::from(224).to_be_bytes::<32>());
+
+    // Tokens array length = 1
+    calldata.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+
+    // Token address
+    calldata.extend_from_slice(&[0u8; 12]);
+    calldata.extend_from_slice(token.as_slice());
+
+    // Amounts array length = 1
+    calldata.extend_from_slice(&U256::from(1).to_be_bytes::<32>());
+
+    // Amount
+    calldata.extend_from_slice(&amount.to_be_bytes::<32>());
+
+    // SwapData length (empty for now - would contain encoded swap steps)
+    calldata.extend_from_slice(&U256::ZERO.to_be_bytes::<32>());
+
+    Bytes::from(calldata)
 }

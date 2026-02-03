@@ -99,7 +99,7 @@ poll_interval_ms = 2000
 enabled = true
 
 # Dry run mode - simulate transactions but don't submit
-dry_run = true
+dry_run = false
 
 # Private key for signing (RECOMMENDED: use PRIVATE_KEY env var instead)
 # private_key = ""
@@ -124,8 +124,8 @@ deadline_secs = 300
 
 # Dashboard Configuration
 [dashboard]
-# Enable web dashboard and API (requires --features dashboard)
-enabled = false
+# Enable web dashboard and API
+enabled = true
 
 # Dashboard host address (env: DASHBOARD_HOST)
 host = "127.0.0.1"
@@ -168,3 +168,43 @@ include_target = true
 # Contract addresses (deployed)
 flashloan_contract = "0xF53bEFDe7B7631BA5749499FB33Fd145372976bA"
 sandwich_contract = "0xD39E9b7905fC6C947Bc8D2790d758EeD109EBCA3"
+
+# Hot Pools Configuration
+[pools]
+# Path to hot pools JSON file (pre-loaded for faster startup)
+hot_pools_file = "data/hot_pools.json"
+
+# High-volume Uniswap V3 pools to prioritize
+hot_pools = [
+    # USDC/WETH pools (highest volume)
+    "0x88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640",  # USDC/WETH 0.05%
+    "0x8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8",  # USDC/WETH 0.3%
+
+    # WBTC/WETH pools
+    "0x4585FE77225b41b697C938B018E2Ac67Ac5a20c0",  # WBTC/WETH 0.05%
+    "0xCBCdF9626bC03E24f779434178A73a0B4bad62eD",  # WBTC/WETH 0.3%
+
+    # WBTC/USDT pool
+    "0x9Db9e0e53058C89e5B94e29621a205198648425B",  # WBTC/USDT 0.3%
+
+    # WETH/USDT pools
+    "0x11b815efB8f581194ae79006d24E0d814B7697F6",  # WETH/USDT 0.05%
+    "0x4e68Ccd3E89f51C3074ca5072bbAC773960dFa36",  # WETH/USDT 0.3%
+
+    # AAVE pools
+    "0x5aB53EE1d50eeF2C1DD3d5402789cd27bB52c1bB",  # AAVE/WETH 0.3%
+    "0x4b0F0Eb9Eb1d3A46c7f6d5E8F04a0cB0cB4cD8e4",  # AAVE/USDC (if exists)
+
+    # Curve 3pool (DAI/USDC/USDT)
+    "0xbEbc44782C7dB0a1A60Cb6fe97d0b483032FF1C7",  # Curve 3pool
+]
+
+# Token addresses for quick reference
+[tokens]
+WETH = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"
+USDC = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+USDT = "0xdAC17F958D2ee523a2206206994597C13D831ec7"
+WBTC = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
+DAI = "0x6B175474E89094C44Da98b954EesdfeDe35CE"
+AAVE = "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"
+USDP = "0x8E870D67F660D95d5be530380D0eC0bd388289E1"
