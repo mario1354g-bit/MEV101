@@ -12,13 +12,24 @@
 //! - `fork_db`: Forking database for lazy state loading from RPC
 //! - `parallel`: Parallel simulation support for evaluating multiple opportunities
 
+pub mod cache_sync;
 pub mod eth_call;
 pub mod fork_db;
 pub mod gas_estimator;
+pub mod mempool_sim;
 pub mod parallel;
 pub mod revm_simulator;
 pub mod swap_simulator;
+pub mod warm_cache;
+pub mod warm_simulator;
 
+pub use cache_sync::{
+    spawn_cache_sync_tasks, run_block_update_loop, run_block_update_loop_ws,
+    run_sync_event_listener, CacheSyncConfig, CacheSyncManager,
+};
+pub use mempool_sim::{
+    MempoolSimulator, MempoolSimResult, PendingTx, DecodedPendingSwap,
+};
 pub use eth_call::EthCallSimulator;
 pub use swap_simulator::SwapSimulator;
 pub use fork_db::{CacheStats, ForkDB, SharedForkDB};
@@ -28,6 +39,8 @@ pub use revm_simulator::{
     RevmSimulator, SandwichSimResult, SimulationResult as RevmSimulationResult,
     StateChange as RevmStateChange, Transaction as RevmTransaction,
 };
+pub use warm_cache::{BlockState, CachedReserves, WarmCache, CacheStats as WarmCacheStats};
+pub use warm_simulator::{WarmSimulator, WarmSimulationResult};
 
 use crate::dex::SwapParams;
 use crate::error::{MevError, SimulationError};

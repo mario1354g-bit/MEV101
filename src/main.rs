@@ -80,6 +80,9 @@ pub struct AppState {
 
     /// Hot pools queue - pools with recent swap activity for priority scanning
     pub hot_pools: Arc<DashMap<Address, chrono::DateTime<chrono::Utc>>>,
+
+    /// Warm cache for high-performance simulation (optional)
+    pub warm_cache: Option<Arc<simulation::WarmCache<alloy::transports::http::Http<alloy::transports::http::Client>, HttpProvider>>>,
 }
 
 /// Real-time price data from Swap events
@@ -290,6 +293,26 @@ async fn async_main() -> Result<(), MevError> {
     let (shutdown_tx, _) = broadcast::channel::<()>(1);
 
     // Create application state
+    // Initialize WarmCache for high-performance simulation
+    let warm_cache = match simulation::WarmCache::new(Arc::clone(&http_provider)).await {
+        Ok(cache) => {
+            info!("WarmCache initialized at block {}", cache.block_state().number);
+
+            // Pre-warm infrastructure contracts (routers, WETH, stablecoins)
+            if let Err(e) = cache.prewarm_infrastructure().await {
+                warn!("Failed to pre-warm infrastructure: {}", e);
+            } else {
+                info!("Infrastructure contracts pre-warmed");
+            }
+
+            Some(Arc::new(cache))
+        }
+        Err(e) => {
+            warn!("Failed to initialize WarmCache: {}. Mempool simulation will use estimates.", e);
+            None
+        }
+    };
+
     let app_state = Arc::new(AppState {
         config: config.clone(),
         db,
@@ -306,6 +329,7 @@ async fn async_main() -> Result<(), MevError> {
         }),
         price_cache: Arc::new(DashMap::new()),
         hot_pools: Arc::new(DashMap::new()),
+        warm_cache,
     });
 
     // Spawn monitoring tasks
@@ -420,6 +444,25 @@ async fn async_main() -> Result<(), MevError> {
                 }
                 _ = shutdown_rx.recv() => {
                     info!("Liquidation monitor shutting down");
+                }
+            }
+        }));
+    }
+
+    // Mempool Simulation Task - processes pending opportunities with accurate simulation
+    if app_state.warm_cache.is_some() {
+        let state = Arc::clone(&app_state);
+        let mut shutdown_rx = shutdown_tx.subscribe();
+        handles.push(tokio::spawn(async move {
+            info!("Starting mempool simulation processor (WarmCache enabled)");
+            tokio::select! {
+                result = run_mempool_simulation_loop(state) => {
+                    if let Err(e) = result {
+                        error!("Mempool simulation error: {}", e);
+                    }
+                }
+                _ = shutdown_rx.recv() => {
+                    info!("Mempool simulation shutting down");
                 }
             }
         }));
@@ -867,14 +910,20 @@ async fn run_mempool_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                                                                     max_priority_fee_per_gas: inner.max_priority_fee_per_gas(),
                                                                     detected_at: chrono::Utc::now(),
                                                                 };
-                                                                pending_txs.insert(format!("{:?}", hash), pending_tx);
+                                                                pending_txs.insert(format!("{:?}", hash), pending_tx.clone());
 
-                                                                // Create sandwich opportunity
+                                                                // ============================================
+                                                                // MEMPOOL-AWARE SIMULATION (if WarmCache available)
+                                                                // ============================================
                                                                 let opp_id = format!("sandwich-{:?}", hash);
-                                                                let estimated_profit = (value_eth * 0.003 * 1e18) as u64; // ~0.3% of trade
-                                                                let gas_cost = 300_000u64 * gas_price as u64; // ~300k gas for sandwich
+                                                                let gas_cost = 300_000u64 * gas_price as u64;
 
-                                                                if estimated_profit > gas_cost + 5_000_000_000_000_000 { // > gas + 0.005 ETH
+                                                                // Try to get WarmCache for accurate simulation
+                                                                // Note: In production, pass warm_cache through the spawn
+                                                                // For now, use estimate as fallback
+                                                                let estimated_profit = (value_eth * 0.003 * 1e18) as u64;
+
+                                                                if estimated_profit > gas_cost + 5_000_000_000_000_000 {
                                                                     let net_profit = estimated_profit - gas_cost;
                                                                     opportunities.insert(opp_id.clone(), MevOpportunity {
                                                                         id: opp_id,
@@ -884,7 +933,7 @@ async fn run_mempool_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                                                                         estimated_gas_cost_wei: gas_cost.to_string(),
                                                                         net_profit_wei: net_profit.to_string(),
                                                                         detected_at: chrono::Utc::now(),
-                                                                        status: "pending".to_string(),
+                                                                        status: "pending_simulation".to_string(),
                                                                         flash_loan_token: None,
                                                                         flash_loan_amount: None,
                                                                         swap_steps: None,
@@ -895,7 +944,7 @@ async fn run_mempool_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                                                                         pair_name: Some("SANDWICH".to_string()),
                                                                     });
                                                                     info!(
-                                                                        "🥪 SANDWICH OPPORTUNITY: {} | profit: {:.4} ETH",
+                                                                        "🥪 SANDWICH TARGET DETECTED: {} | estimated: {:.4} ETH (needs simulation)",
                                                                         format!("{:?}", hash), net_profit as f64 / 1e18
                                                                     );
                                                                 }
@@ -994,6 +1043,246 @@ async fn run_mempool_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                 tracing::debug!("Failed to get pending block: {}", e);
             }
         }
+
+        tokio::time::sleep(poll_interval).await;
+    }
+}
+
+/// Run mempool simulation loop - processes pending opportunities with accurate simulation.
+///
+/// This loop picks up opportunities marked as "pending_simulation" and validates them
+/// using the MempoolSimulator, which applies pending transactions to the state before
+/// simulating our arbitrage. This eliminates phantom profits.
+async fn run_mempool_simulation_loop(state: Arc<AppState>) -> Result<(), MevError> {
+    use simulation::{MempoolSimulator, PendingTx};
+
+    let poll_interval = std::time::Duration::from_millis(100); // Fast polling for quick response
+    let mut simulations_run = 0u64;
+    let mut profitable_found = 0u64;
+
+    // Get the warm cache - if not available, this task shouldn't be running
+    let warm_cache = match &state.warm_cache {
+        Some(cache) => Arc::clone(cache),
+        None => {
+            warn!("Mempool simulation loop started but WarmCache not available");
+            return Ok(());
+        }
+    };
+
+    // Bot address for simulations (use zero address for now, or load from config)
+    let bot_address = Address::ZERO; // TODO: Load from wallet config
+
+    info!("Mempool simulation loop started with WarmCache");
+
+    loop {
+        // Find opportunities with status "pending_simulation"
+        let pending_opps: Vec<(String, MevOpportunity)> = state.opportunities
+            .iter()
+            .filter(|entry| entry.status == "pending_simulation")
+            .map(|entry| (entry.key().clone(), entry.value().clone()))
+            .collect();
+
+        if !pending_opps.is_empty() {
+            info!(
+                "Processing {} pending simulation opportunities",
+                pending_opps.len()
+            );
+        }
+
+        for (opp_id, opp) in pending_opps {
+            // Create a new simulator for each simulation (fresh block state)
+            let mut simulator = MempoolSimulator::new(Arc::clone(&warm_cache), bot_address);
+            simulator.sync_block_env(); // Ensure we're simulating on next block
+
+            // Get the target transaction from pending_txs
+            let target_tx_opt = state.pending_txs.get(&opp.target_tx).map(|entry| {
+                let tx = entry.value();
+                PendingTx {
+                    hash: tx.hash.clone(),
+                    from: tx.from.parse().unwrap_or(Address::ZERO),
+                    to: tx.to.as_ref()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(Address::ZERO),
+                    value: tx.value.parse::<u128>().map(U256::from).unwrap_or(U256::ZERO),
+                    data: Bytes::from(tx.data.clone()),
+                    gas_limit: 500_000, // Default gas limit
+                    gas_price: tx.gas_price.map(U256::from).unwrap_or(U256::from(30_000_000_000u64)),
+                }
+            });
+
+            let sim_result = match opp.opportunity_type.as_str() {
+                "sandwich" => {
+                    // For sandwich, we need the target transaction
+                    if let Some(target_tx) = target_tx_opt {
+                        // Decode the pending swap to get the path
+                        if let Some(decoded) = simulator.decode_pending_swap(&target_tx) {
+                            // Calculate frontrun amount (typically 1-10% of victim's swap)
+                            let frontrun_amount = decoded.amount_in / U256::from(10);
+
+                            // Frontrun: same direction as victim
+                            let frontrun_path = decoded.path.clone();
+                            // Backrun: reverse direction
+                            let backrun_path: Vec<Address> = decoded.path.iter().rev().copied().collect();
+
+                            // Use Uniswap V2 router for simulation
+                            let router = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+                                .parse::<Address>()
+                                .unwrap();
+
+                            let result = simulator.simulate_sandwich(
+                                &target_tx,
+                                frontrun_amount,
+                                frontrun_path,
+                                backrun_path,
+                                router,
+                            );
+
+                            Some(result)
+                        } else {
+                            info!(
+                                opp_id = %opp_id,
+                                "Could not decode pending swap for sandwich simulation"
+                            );
+                            None
+                        }
+                    } else {
+                        info!(
+                            opp_id = %opp_id,
+                            target = %opp.target_tx,
+                            "Target transaction not found for sandwich"
+                        );
+                        None
+                    }
+                }
+                "backrun" => {
+                    // For backrun, simulate our arb after the target tx
+                    if let Some(target_tx) = target_tx_opt {
+                        if let Some(decoded) = simulator.decode_pending_swap(&target_tx) {
+                            // Backrun in the opposite direction to capture the price impact
+                            let arb_path: Vec<Address> = decoded.path.iter().rev().copied().collect();
+                            let arb_amount = decoded.amount_in / U256::from(20); // Conservative sizing
+
+                            let router = "0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D"
+                                .parse::<Address>()
+                                .unwrap();
+
+                            let result = simulator.simulate_backrun(
+                                &target_tx,
+                                router,
+                                arb_amount,
+                                arb_path,
+                            );
+
+                            Some(result)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                }
+                _ => {
+                    // For other opportunity types, mark as simulated without mempool awareness
+                    // They can be processed by the regular simulator
+                    if let Some(mut entry) = state.opportunities.get_mut(&opp_id) {
+                        entry.status = "simulated".to_string();
+                    }
+                    continue;
+                }
+            };
+
+            simulations_run += 1;
+
+            // Update opportunity based on simulation result
+            if let Some(result) = sim_result {
+                if let Some(mut entry) = state.opportunities.get_mut(&opp_id) {
+                    if result.success && result.profit > U256::ZERO {
+                        // Profitable! Update with accurate numbers
+                        let gas_cost_wei = U256::from(result.total_gas) * U256::from(30_000_000_000u64); // Assume 30 gwei
+                        let net_profit = if result.profit > gas_cost_wei {
+                            result.profit - gas_cost_wei
+                        } else {
+                            U256::ZERO
+                        };
+
+                        // Only mark as ready if net profit exceeds minimum threshold (0.005 ETH)
+                        let min_threshold = U256::from(5_000_000_000_000_000u64); // 0.005 ETH
+
+                        if net_profit > min_threshold {
+                            entry.estimated_profit_wei = result.profit.to_string();
+                            entry.estimated_gas_cost_wei = gas_cost_wei.to_string();
+                            entry.net_profit_wei = net_profit.to_string();
+                            entry.status = "ready_to_execute".to_string();
+
+                            profitable_found += 1;
+
+                            // Convert to ETH for logging (divide by 10^18)
+                            let profit_eth_milli = result.profit / U256::from(10u64.pow(15));
+                            let net_profit_eth_milli = net_profit / U256::from(10u64.pow(15));
+
+                            info!(
+                                opp_id = %opp_id,
+                                profit_meth = %profit_eth_milli, // milliETH
+                                net_profit_meth = %net_profit_eth_milli, // milliETH
+                                gas_used = result.total_gas,
+                                "PROFITABLE OPPORTUNITY CONFIRMED via mempool simulation"
+                            );
+                        } else {
+                            entry.status = "rejected_low_profit".to_string();
+                            entry.net_profit_wei = net_profit.to_string();
+                            info!(
+                                opp_id = %opp_id,
+                                net_profit_wei = %net_profit,
+                                "Opportunity rejected: profit below threshold"
+                            );
+                        }
+                    } else {
+                        // Not profitable or failed
+                        entry.status = "rejected_simulation".to_string();
+                        if let Some(err) = &result.error {
+                            info!(
+                                opp_id = %opp_id,
+                                error = %err,
+                                "Opportunity rejected by simulation"
+                            );
+                        } else {
+                            info!(
+                                opp_id = %opp_id,
+                                profit = %result.profit,
+                                "Opportunity rejected: not profitable"
+                            );
+                        }
+                    }
+                }
+            } else {
+                // Could not simulate - mark as failed
+                if let Some(mut entry) = state.opportunities.get_mut(&opp_id) {
+                    entry.status = "simulation_failed".to_string();
+                }
+            }
+
+            // Clean up old pending transactions after processing
+            if opp.detected_at < chrono::Utc::now() - chrono::Duration::seconds(30) {
+                state.pending_txs.remove(&opp.target_tx);
+            }
+        }
+
+        // Periodic stats logging
+        if simulations_run > 0 && simulations_run % 100 == 0 {
+            info!(
+                simulations_run = simulations_run,
+                profitable_found = profitable_found,
+                "Mempool simulation stats"
+            );
+        }
+
+        // Clean up old opportunities that are no longer relevant
+        let now = chrono::Utc::now();
+        state.opportunities.retain(|_, opp| {
+            let age = now.signed_duration_since(opp.detected_at).num_seconds();
+            // Keep opportunities for 2 minutes max
+            age < 120
+        });
 
         tokio::time::sleep(poll_interval).await;
     }
