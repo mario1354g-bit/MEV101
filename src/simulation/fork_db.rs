@@ -246,21 +246,25 @@ where
     }
 
     /// Blocking wrapper for fetch_account.
+    /// Uses block_in_place to safely block within async context.
     fn fetch_account_blocking(&self, address: Address) -> Result<AccountInfo, String> {
-        self.runtime_handle
-            .block_on(async { self.fetch_account(address).await })
+        tokio::task::block_in_place(|| {
+            self.runtime_handle.block_on(self.fetch_account(address))
+        })
     }
 
     /// Blocking wrapper for fetch_storage.
     fn fetch_storage_blocking(&self, address: Address, slot: U256) -> Result<U256, String> {
-        self.runtime_handle
-            .block_on(async { self.fetch_storage(address, slot).await })
+        tokio::task::block_in_place(|| {
+            self.runtime_handle.block_on(self.fetch_storage(address, slot))
+        })
     }
 
     /// Blocking wrapper for fetch_code.
     fn fetch_code_blocking(&self, code_hash: B256) -> Result<Bytecode, String> {
-        self.runtime_handle
-            .block_on(async { self.fetch_code(code_hash).await })
+        tokio::task::block_in_place(|| {
+            self.runtime_handle.block_on(self.fetch_code(code_hash))
+        })
     }
 }
 

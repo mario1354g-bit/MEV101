@@ -55,6 +55,9 @@ run_migrations = true
 
 # Monitoring Configuration
 [monitoring]
+# Enable Artemis architecture (properly wired collectors -> strategies -> executor)
+artemis_mode = true
+
 # Enable mempool (pending transaction) monitoring
 mempool_enabled = true
 
@@ -96,7 +99,7 @@ poll_interval_ms = 2000
 enabled = true
 
 # Dry run mode - simulate transactions but don't submit
-dry_run = false
+dry_run = true
 
 # Private key for signing (RECOMMENDED: use PRIVATE_KEY env var instead)
 # private_key = ""

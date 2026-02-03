@@ -107,8 +107,37 @@ pub mod routers {
     pub const KYBERSWAP_ROUTER: Address =
         address!("6131B5fae19EA4f9D964eAc0408E4408b66337b5");
 
-    /// Get all monitored router addresses
+    /// Aggregator addresses to SKIP - they cause simulation hangs due to complex multi-hop routing
+    /// These touch dozens of contracts and overwhelm REVM state fetching
+    pub fn skip_aggregators() -> Vec<Address> {
+        vec![
+            ONEINCH_V5,           // 1inch v5 - massive internal calls
+            ONEINCH_V6,           // 1inch v6 - massive internal calls
+            ZEROX_EXCHANGE_PROXY, // 0x - complex routing
+            PARASWAP_V5,          // Paraswap - multi-DEX aggregation
+            KYBERSWAP_ROUTER,     // Kyberswap - aggregator
+            UNISWAP_UNIVERSAL_ROUTER, // Universal Router - complex batched calls
+        ]
+    }
+
+    /// Check if address is a skipped aggregator
+    pub fn is_skip_aggregator(addr: Address) -> bool {
+        skip_aggregators().contains(&addr)
+    }
+
+    /// Get all monitored router addresses (excludes aggregators that cause hangs)
     pub fn all_routers() -> Vec<Address> {
+        vec![
+            UNISWAP_V2_ROUTER,
+            UNISWAP_V3_ROUTER,
+            UNISWAP_V3_ROUTER2,
+            SUSHISWAP_ROUTER,
+            // Note: Aggregators removed - they cause simulation hangs
+        ]
+    }
+
+    /// Get all routers including aggregators (for detection only, not simulation)
+    pub fn all_routers_with_aggregators() -> Vec<Address> {
         vec![
             UNISWAP_V2_ROUTER,
             UNISWAP_V3_ROUTER,
@@ -543,15 +572,38 @@ impl SandwichStrategy {
 
     /// Evaluate if a swap is a good sandwich target (sync version for quick filtering)
     fn evaluate_target_quick(&self, swap: &DetectedSwap) -> bool {
-        // Quick filter based on value
-        let value_eth = swap.amount_in.try_into().unwrap_or(0u128) as f64 / 1e18;
+        // Quick filter: only swaps with ETH/WETH as input have reliable value
+        if swap.token_in != WETH && swap.token_in != Address::ZERO && swap.value == U256::ZERO {
+            return false;
+        }
+
+        let value_eth = if swap.token_in == WETH || swap.token_in == Address::ZERO {
+            swap.amount_in.try_into().unwrap_or(0u128) as f64 / 1e18
+        } else {
+            swap.value.try_into().unwrap_or(0u128) as f64 / 1e18
+        };
+
         value_eth >= self.config.min_victim_value_eth
     }
 
     /// Evaluate if a swap is a good sandwich target with optional REVM simulation
     async fn evaluate_target(&self, swap: &DetectedSwap) -> Option<SandwichAction> {
-        // Check minimum value
-        let value_eth = swap.amount_in.try_into().unwrap_or(0u128) as f64 / 1e18;
+        // Calculate actual ETH value:
+        // - If swapping ETH/WETH -> token: use amount_in
+        // - If swapping token -> ETH/WETH: use tx value or skip (can't easily value tokens)
+        // - Otherwise: skip (no reliable ETH value)
+        let value_eth = if swap.token_in == WETH || swap.token_in == Address::ZERO {
+            // Swapping ETH/WETH for tokens - amount_in IS the ETH value
+            swap.amount_in.try_into().unwrap_or(0u128) as f64 / 1e18
+        } else if swap.value > U256::ZERO {
+            // Use tx value if available (for ETH swaps)
+            swap.value.try_into().unwrap_or(0u128) as f64 / 1e18
+        } else {
+            // Token -> token or token -> ETH without value, skip
+            debug!("Skipping swap: no reliable ETH value (token_in: {:?})", swap.token_in);
+            return None;
+        };
+
         if value_eth < self.config.min_victim_value_eth {
             return None;
         }
@@ -568,8 +620,8 @@ impl SandwichStrategy {
             let frontrun_eth = (value_eth * 0.5).min(self.config.max_frontrun_eth);
             let frontrun_amount = U256::from((frontrun_eth * 1e18) as u128);
 
-            info!(
-                "REVM Simulating sandwich for {} | victim: {:.4} ETH | frontrun: {:.4} ETH",
+            debug!(
+                "Simulating: {} | victim: {:.4} ETH | frontrun: {:.4} ETH",
                 id, value_eth, frontrun_eth
             );
 
@@ -689,6 +741,12 @@ impl Strategy for SandwichStrategy {
                 }
 
                 if !is_router {
+                    return Ok(None);
+                }
+
+                // Skip aggregators - they cause simulation hangs due to complex routing
+                if routers::is_skip_aggregator(to) {
+                    debug!("SandwichStrategy: Skipping aggregator {:?} (causes simulation hangs)", to);
                     return Ok(None);
                 }
 

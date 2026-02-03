@@ -232,6 +232,14 @@ async fn async_main() -> Result<(), MevError> {
         let rpc_url = config.ethereum.http_rpc_url.clone();
 
         let signer_key = config::Config::get_private_key().unwrap_or_default();
+
+        // Log wallet address for verification
+        if !signer_key.is_empty() {
+            if let Ok(signer) = signer_key.parse::<alloy::signers::local::PrivateKeySigner>() {
+                info!("Executor wallet address: {}", signer.address());
+            }
+        }
+
         let flashloan_contract = std::env::var("FLASHLOAN_CONTRACT")
             .ok()
             .and_then(|s| s.parse().ok())
@@ -887,6 +895,21 @@ async fn run_mempool_monitor(state: Arc<AppState>) -> Result<(), MevError> {
                                                         );
 
                                                         if is_swap {
+                                                            // Skip aggregators - they cause simulation hangs
+                                                            let skip_aggregators = [
+                                                                "0x1111111254eeb25477b68fb85ed929f73a960582", // 1inch v5
+                                                                "0x1111111254fb6c44bac0bed2854e76f90643097d", // 1inch v4
+                                                                "0x111111125421ca6dc452d289314280a0f8842a65", // 1inch v6
+                                                                "0xdef1c0ded9bec7f1a1670819833240f027b25eff", // 0x
+                                                                "0x3fc91a3afd70395cd496c647d5a6cc9d4b2b7fad", // Universal Router
+                                                                "0xdef171fe48cf0115b1d80b88dc8eab59176fee57", // Paraswap
+                                                            ];
+                                                            let to_lower = format!("{:?}", to).to_lowercase();
+                                                            if skip_aggregators.iter().any(|&agg| to_lower.contains(agg)) {
+                                                                tracing::debug!("Skipping aggregator tx to {} (causes hangs)", to_lower);
+                                                                return; // Skip this tx - we're in async block
+                                                            }
+
                                                             let value_wei: u128 = inner.value().try_into().unwrap_or(0);
                                                             let value_eth = value_wei as f64 / 1e18;
                                                             let gas_price = tx.effective_gas_price.unwrap_or(inner.gas_price().unwrap_or(0));

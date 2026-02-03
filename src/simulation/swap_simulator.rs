@@ -255,7 +255,7 @@ where
                             let amounts = decoded.amounts;
                             let amount_out = amounts.last().copied().unwrap_or(U256::ZERO);
 
-                            info!(
+                            debug!(
                                 amount_in = %amount_in,
                                 amount_out = %amount_out,
                                 gas_used = gas_used,

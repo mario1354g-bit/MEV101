@@ -112,6 +112,32 @@ impl FlashbotsExecutor {
         })
     }
 
+    /// Initialize simulator with wallet balance
+    /// In dry_run mode, uses simulated balance. In live mode, fetches real balance.
+    pub async fn init_simulator_balance(&self) -> eyre::Result<()> {
+        if let Some(ref signer) = self.signer {
+            let bot_address = signer.address();
+
+            let balance = if self.config.dry_run {
+                // Use simulated balance for dry run (2 ETH)
+                let sim_balance = U256::from(2_000_000_000_000_000_000u128); // 2 ETH
+                info!("Simulator: Using simulated balance 2 ETH for {} (dry run)", bot_address);
+                sim_balance
+            } else {
+                // Fetch real balance from chain for live mode
+                let provider = ProviderBuilder::new().on_http(self.config.rpc_url.parse()?);
+                let real_balance = provider.get_balance(bot_address).await?;
+                let balance_eth = real_balance.to::<u128>() as f64 / 1e18;
+                info!("Simulator: Set real balance {:.4} ETH for {}", balance_eth, bot_address);
+                real_balance
+            };
+
+            let mut sim = self.simulator.write();
+            sim.set_balance(bot_address, balance);
+        }
+        Ok(())
+    }
+
     /// Update simulator block environment from RPC
     pub async fn sync_block_env(&self) -> eyre::Result<()> {
         let provider = ProviderBuilder::new().on_http(self.config.rpc_url.parse()?);

@@ -41,7 +41,7 @@ pub async fn run_artemis(
     let mempool_config = MempoolCollectorConfig {
         ws_url: ws_url.clone(),
         fetch_full_tx: true,
-        sample_rate: 5, // Fetch every 5th tx
+        sample_rate: 1, // Fetch EVERY tx for maximum opportunity detection
     };
 
     let swap_config = SwapEventCollectorConfig::mainnet_defaults(ws_url.clone());
@@ -80,6 +80,10 @@ pub async fn run_artemis(
         dry_run,
     };
 
+    // Create executor and initialize with real wallet balance
+    let executor = FlashbotsExecutor::new(flashbots_config)?;
+    executor.init_simulator_balance().await?;
+
     // Build and run engine
     let engine = Engine::new(engine_config)
         // Collectors
@@ -91,7 +95,7 @@ pub async fn run_artemis(
         .add_strategy(SandwichStrategy::new(sandwich_config))
         .add_strategy(LiquidationStrategy::new(liquidation_config))
         // Executors
-        .add_executor(FlashbotsExecutor::new(flashbots_config)?);
+        .add_executor(executor);
 
     info!("Artemis Engine configured, starting...");
     engine.run().await
