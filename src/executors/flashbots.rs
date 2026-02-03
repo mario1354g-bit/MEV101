@@ -11,7 +11,7 @@ use alloy::primitives::{address, Address, B256, Bytes, U256, keccak256};
 use alloy::providers::{Provider, ProviderBuilder};
 use alloy::rpc::types::TransactionRequest;
 use alloy::signers::local::PrivateKeySigner;
-use alloy::signers::Signer;
+use alloy::signers::{Signer, SignerSync};
 use async_trait::async_trait;
 use parking_lot::RwLock;
 use reqwest::Client;
@@ -305,19 +305,35 @@ impl FlashbotsExecutor {
         // Serialize request body
         let body = serde_json::to_string(&request)?;
 
-        // Sign the request body hash for Flashbots authentication
-        // Flashbots expects EIP-191 personal sign: sign("\x19Ethereum Signed Message:\n" + len + keccak256(body))
+        // Flashbots expects eth_sign style: sign(keccak256("\x19Ethereum Signed Message:\n" + len + body))
+        // sign_message_sync handles the EIP-191 prefix internally
+        let signature = signer.sign_message_sync(body.as_bytes())
+            .map_err(|e| eyre::eyre!("Failed to sign flashbots header: {}", e))?;
+
+        // For debug - compute the hash that will be displayed
         let body_hash = keccak256(body.as_bytes());
 
-        // Use sign_message which adds the Ethereum message prefix (EIP-191)
-        let signature = signer.sign_message(body_hash.as_slice()).await?;
+        // Get signature bytes and ensure v is 27/28 (legacy/rpc standard)
+        let mut sig_bytes = signature.as_bytes().to_vec();
+        if sig_bytes[64] < 27 {
+            sig_bytes[64] += 27;
+        }
 
-        // Format: address:signature (65 bytes: r[32] + s[32] + v[1])
-        let sig_bytes = signature.as_bytes();
+        // Format: 0x<address>:0x<signature>
+        // {:#x} formats as lowercase hex with 0x prefix (e.g., 0xabcdef...)
         let sig_header = format!(
-            "{}:0x{}",
+            "{:#x}:0x{}",
             signer.address(),
-            hex::encode(sig_bytes)
+            hex::encode(&sig_bytes)
+        );
+
+        info!(
+            "Flashbots sig debug: body_len={}, body_hash=0x{}, addr={}, sig_v={}, header={}",
+            body.len(),
+            hex::encode(body_hash),
+            signer.address(),
+            sig_bytes[64],
+            sig_header
         );
 
         debug!(
