@@ -32,7 +32,9 @@ pub mod endpoints {
 pub struct FlashbotsBundle {
     pub txs: Vec<String>,
     pub block_number: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub min_timestamp: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub max_timestamp: Option<u64>,
 }
 
