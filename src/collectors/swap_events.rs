@@ -109,6 +109,22 @@ impl SwapEventCollectorConfig {
                 token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
                 name: "UniV3 WBTC/WETH 0.3%".to_string(),
             },
+            // UniV3 USDC/WETH 0.3%
+            PoolInfo {
+                address: address!("8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"),
+                dex: DexType::UniswapV3,
+                token0: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+                token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
+                name: "UniV3 USDC/WETH 0.3%".to_string(),
+            },
+            // UniV3 WBTC/WETH 0.05%
+            PoolInfo {
+                address: address!("4585FE77225b41b697C938B018E2Ac67Ac5a20c0"),
+                dex: DexType::UniswapV3,
+                token0: address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), // WBTC
+                token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
+                name: "UniV3 WBTC/WETH 0.05%".to_string(),
+            },
             // SushiSwap pools
             PoolInfo {
                 address: address!("397FF1542f962076d0BFE58eA045FfA2d347ACa0"),
@@ -116,6 +132,44 @@ impl SwapEventCollectorConfig {
                 token0: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
                 token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
                 name: "Sushi USDC/WETH".to_string(),
+            },
+            PoolInfo {
+                address: address!("CEfF51756c56CeFFCA006cD410B03FFC46dd3a58"),
+                dex: DexType::SushiSwap,
+                token0: address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), // WBTC
+                token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
+                name: "Sushi WBTC/WETH".to_string(),
+            },
+            // UniV3 WBTC/USDT
+            PoolInfo {
+                address: address!("9Db9e0e53058C89e5B94e29621a205198648425B"),
+                dex: DexType::UniswapV3,
+                token0: address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"), // WBTC
+                token1: address!("dAC17F958D2ee523a2206206994597C13D831ec7"), // USDT
+                name: "UniV3 WBTC/USDT 0.3%".to_string(),
+            },
+            // UniV3 AAVE/WETH
+            PoolInfo {
+                address: address!("5aB53EE1d50eeF2C1DD3d5402789cd27bB52c1bB"),
+                dex: DexType::UniswapV3,
+                token0: address!("7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"), // AAVE
+                token1: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
+                name: "UniV3 AAVE/WETH 0.3%".to_string(),
+            },
+            // DAI/USDC pools
+            PoolInfo {
+                address: address!("6c6Bc977E13Df9b0de53b251522280BB72383700"),
+                dex: DexType::UniswapV3,
+                token0: address!("6B175474E89094C44Da98b954EedeAC495271d0F"), // DAI
+                token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+                name: "UniV3 DAI/USDC 0.01%".to_string(),
+            },
+            PoolInfo {
+                address: address!("AE461cA67B15dc8dc81CE7615e0320dA1A9aB8D5"),
+                dex: DexType::UniswapV2,
+                token0: address!("6B175474E89094C44Da98b954EedeAC495271d0F"), // DAI
+                token1: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"), // USDC
+                name: "UniV2 DAI/USDC".to_string(),
             },
             // Curve pools
             PoolInfo {
