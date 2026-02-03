@@ -1,38 +1,81 @@
-# Long-Tail MEV Monitor
+# Longtail MEV Bot
 
-High-performance Rust MEV bot for detecting and executing arbitrage opportunities across decentralized exchanges. Monitors 57 trading pairs across Uniswap V2, SushiSwap, ShibaSwap, and Fraxswap with real-time profit estimation and flash loan execution.
+High-performance Rust MEV bot implementing Paradigm's Artemis architecture for detecting and executing arbitrage, sandwich, and liquidation opportunities on Ethereum mainnet.
 
-## Live Dashboard
+## Architecture
 
-![Dashboard](https://img.shields.io/badge/Dashboard-Live-brightgreen)
-
-Real-time web dashboard at `http://localhost:8080` showing:
-- Active arbitrage opportunities with profit estimates (USD/ETH)
-- Type classification (ARB, SANDWICH, LIQUIDATION, BACKRUN)
-- Spread percentages and trading routes
-- Simulation status (Pending/Verified/Failed)
-- Top pairs and best spreads charts
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         Artemis Architecture                             │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│   COLLECTORS              STRATEGIES              EXECUTORS              │
+│   ───────────             ──────────              ─────────              │
+│   ┌─────────┐            ┌──────────┐           ┌───────────┐           │
+│   │ Mempool │───────────▶│ Sandwich │──────────▶│ Flashbots │           │
+│   └─────────┘            └──────────┘           └───────────┘           │
+│   ┌─────────┐            ┌──────────┐           ┌───────────┐           │
+│   │  Block  │───────────▶│Arbitrage │──────────▶│  Direct   │           │
+│   └─────────┘            └──────────┘           └───────────┘           │
+│   ┌─────────┐            ┌──────────┐                                   │
+│   │  Swap   │───────────▶│Liquidate │                                   │
+│   │ Events  │            └──────────┘                                   │
+│   └─────────┘                                                           │
+│        │                       │                       │                │
+│        └───────────────────────┼───────────────────────┘                │
+│                                ▼                                        │
+│                    ┌────────────────────┐                               │
+│                    │   REVM Simulator   │                               │
+│                    │  ┌──────────────┐  │                               │
+│                    │  │  Warm Cache  │  │                               │
+│                    │  │   Fork DB    │  │                               │
+│                    │  │   Parallel   │  │                               │
+│                    │  └──────────────┘  │                               │
+│                    └────────────────────┘                               │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
 
 ## Features
 
-### Detection
-- **57 Trading Pairs** across 4 DEXes (UniV2, Sushi, Shiba, Frax)
-- **Real-time Price Monitoring** via Alchemy WebSocket
-- **Cross-DEX Arbitrage** detection with spread calculation
-- **False Positive Filtering** for bad data and extreme spreads
-- **High Priority Alerts** for >0.5% spread opportunities
+### MEV Strategies
+- **Sandwich Attacks** - Frontrun/backrun large swaps with REVM-simulated profit calculation
+- **Cross-DEX Arbitrage** - Price discrepancy detection across Uniswap V2/V3, SushiSwap, 0x
+- **Multi-hop Arbitrage** - Triangular and n-hop arbitrage path discovery
+- **Liquidations** - Lending protocol liquidation opportunities (Aave, Compound)
+
+### Simulation Engine
+- **REVM Local Simulation** - Full EVM execution without RPC latency
+- **Fork DB** - Lazy state loading from RPC with caching
+- **Warm Cache** - Pre-loaded pool reserves for sub-millisecond simulation
+- **Parallel Simulator** - Concurrent opportunity evaluation
+- **Mempool Simulation** - Simulate pending transactions to predict state
 
 ### Execution
-- **Flash Loan Support**: Balancer (0% fee), Aave V3 (0.05% fee)
-- **Flashbots Integration** for MEV protection
-- **Local Simulation** via REVM before execution
-- **Gas Optimization** with dynamic pricing
+- **Flashbots Bundles** - MEV-protected submission to block builders
+- **Flash Loans** - Balancer (0% fee) and Aave V3 (0.05% fee) integration
+- **Direct Execution** - Standard transaction submission fallback
+- **Gas Optimization** - Dynamic gas pricing with priority fee management
+
+### Collectors
+- **Mempool Monitor** - Pending transaction stream via WebSocket
+- **Block Monitor** - New block notifications and state updates
+- **Swap Event Collector** - Real-time DEX swap event parsing
 
 ### Infrastructure
-- **Alchemy RPC** integration (HTTP + WebSocket)
-- **Reth Node** support for local simulation
-- **SQLite Storage** for opportunity tracking
-- **Axum Dashboard** with 5-second auto-refresh
+- **Alloy** - Modern Rust Ethereum library (replaces ethers-rs)
+- **SQLite** - Opportunity tracking and analytics
+- **Axum Dashboard** - Real-time web UI with live stats
+- **Multi-threaded Runtime** - Optimized tokio runtime for low latency
+
+## Smart Contracts
+
+Two Solidity contracts deployed on mainnet:
+
+| Contract | Address | Purpose |
+|----------|---------|---------|
+| FlashloanArbitrage | `0xF53bEFDe7B7631BA5749499FB33Fd145372976bA` | Flash loan arbitrage execution |
+| SandwichExecutor | `0xD39E9b7905fC6C947Bc8D2790d758EeD109EBCA3` | Sandwich attack execution |
 
 ## Quick Start
 
@@ -46,145 +89,183 @@ cargo build --release
 
 ### 2. Configure
 
-Edit `config.toml`:
+Copy and edit the config file:
+
+```bash
+cp .env.example .env
+# Edit .env with your private key and RPC URLs
+```
+
+Key environment variables:
+```bash
+PRIVATE_KEY=your_private_key_here
+ETH_RPC_URL=https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
+ETH_WS_URL=wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY
+```
+
+Edit `config.toml` for detailed settings:
 
 ```toml
-[ethereum]
-http_rpc_url = "https://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
-ws_rpc_url = "wss://eth-mainnet.g.alchemy.com/v2/YOUR_KEY"
-chain_id = 1
+[monitoring]
+artemis_mode = true      # Enable Artemis architecture
+mempool_enabled = true   # Monitor pending transactions
+min_profit_eth = 0.005   # Minimum profit threshold
 
 [execution]
 enabled = true
-dry_run = false  # Set true for monitoring only
-min_profit_eth = 0.01
+dry_run = true           # Set false for live execution
+use_flashbots = true     # Submit via Flashbots relay
 
-[dashboard]
+[simulation]
 enabled = true
-host = "127.0.0.1"
-port = 8080
+parallel = true
+workers = 4
 ```
 
-### 3. Set Private Key
+### 3. Run
 
 ```bash
-export PRIVATE_KEY="your_private_key_here"
-```
-
-### 4. Run
-
-```bash
+# Monitoring mode (dry run)
 ./target/release/longtail-mev-monitor
+
+# With dashboard
+./target/release/longtail-mev-monitor --features dashboard
 ```
 
-### 5. View Dashboard
+### 4. Dashboard
 
-Open http://127.0.0.1:8080
+Open http://127.0.0.1:8080 for real-time monitoring:
+- Live opportunity feed
+- Profit/loss tracking
+- Gas statistics
+- Pool activity heatmap
 
-## Architecture
-
-```
-┌────────────────────────────────────────────────────────────────┐
-│                    MEV Monitor Architecture                     │
-├────────────────────────────────────────────────────────────────┤
-│                                                                 │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │
-│  │   Alchemy   │───▶│  DEX Price  │───▶│ Opportunity │        │
-│  │  WebSocket  │    │   Scanner   │    │  Detector   │        │
-│  └─────────────┘    └─────────────┘    └─────────────┘        │
-│         │                                      │               │
-│         ▼                                      ▼               │
-│  ┌─────────────┐    ┌─────────────┐    ┌─────────────┐        │
-│  │   Block     │    │    REVM     │◀───│  Flashloan  │        │
-│  │  Monitor    │    │  Simulator  │    │  Executor   │        │
-│  └─────────────┘    └─────────────┘    └─────────────┘        │
-│                            │                   │               │
-│                            ▼                   ▼               │
-│                     ┌─────────────┐    ┌─────────────┐        │
-│                     │  Dashboard  │    │  Flashbots  │        │
-│                     │   (Axum)    │    │   Bundle    │        │
-│                     └─────────────┘    └─────────────┘        │
-│                                                                 │
-└────────────────────────────────────────────────────────────────┘
-```
-
-## DEX Coverage
-
-| DEX | Router | Pairs |
-|-----|--------|-------|
-| Uniswap V2 | 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D | 57 |
-| SushiSwap | 0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F | 57 |
-| ShibaSwap | 0x03f7724180AA6b939894B5Ca4314783B0b36b329 | 57 |
-| Fraxswap | 0xC14d550632db8592D1243Edc8B95b0Ad06703867 | 57 |
-
-## Profit Calculation
-
-Dashboard estimates profit assuming 100 ETH flash loan:
+## Project Structure
 
 ```
-Spread: 0.9%
-Flash Loan: 100 ETH (Balancer, 0% fee)
-Gross Profit: 0.9 ETH
-Gas Cost: ~0.02 ETH
-Net Profit: ~0.88 ETH (~$2,200)
+src/
+├── artemis/           # Artemis engine orchestration
+│   ├── collector.rs   # Collector trait
+│   ├── strategy.rs    # Strategy trait
+│   ├── executor.rs    # Executor trait
+│   └── engine.rs      # Event processing pipeline
+├── collectors/        # Data collection
+│   ├── mempool.rs     # Pending tx monitoring
+│   ├── block.rs       # Block notifications
+│   └── swap_events.rs # DEX swap parsing
+├── strategies/        # MEV detection
+│   ├── sandwich.rs    # Sandwich attack logic
+│   ├── arbitrage.rs   # Cross-DEX arbitrage
+│   └── liquidation.rs # Liquidation detection
+├── simulation/        # Transaction simulation
+│   ├── revm_simulator.rs  # REVM execution
+│   ├── fork_db.rs         # State forking
+│   ├── warm_cache.rs      # Reserve caching
+│   ├── swap_simulator.rs  # Swap simulation
+│   └── parallel.rs        # Concurrent simulation
+├── executors/         # Transaction execution
+│   ├── flashbots.rs   # Flashbots bundle submission
+│   └── direct.rs      # Direct tx submission
+├── detectors/         # Opportunity detection
+│   ├── sandwich_detector.rs
+│   ├── price_discrepancy.rs
+│   ├── multihop.rs
+│   └── liquidity_event.rs
+├── dex/               # DEX integrations
+│   ├── uniswap_v2.rs
+│   ├── uniswap_v3.rs
+│   └── pool_registry.rs
+└── storage/           # Database layer
+contracts/
+├── FlashloanArbitrage.sol  # Flash loan execution
+└── SandwichExecutor.sol    # Sandwich execution
 ```
 
-## Flash Loan Execution
+## DEX Support
 
-Deploy the FlashloanArbitrage contract:
-
-```bash
-cd contracts
-forge create FlashloanArbitrage --rpc-url $RPC_URL --private-key $PRIVATE_KEY
-```
-
-Add to config:
-
-```toml
-[flashloan]
-enabled = true
-arbitrage_contract = "0xYOUR_CONTRACT_ADDRESS"
-preferred_provider = "balancer"  # 0% fee
-```
-
-## Local Simulation (Reth)
-
-For accurate simulation before execution:
-
-```bash
-# Start reth with MEV config
-./start-reth-mev.sh
-
-# Or manually
-reth node --http --http.api eth,net,web3,debug,trace
-```
+| DEX | Type | Router/Factory |
+|-----|------|----------------|
+| Uniswap V2 | AMM | `0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D` |
+| Uniswap V3 | Concentrated | `0xE592427A0AEce92De3Edee1F18E0157C05861564` |
+| SushiSwap | AMM | `0xd9e1cE17f2641f24aE83637ab66a2cca9C378B9F` |
+| 0x | Aggregator | `0xDef1C0ded9bec7F1a1670819833240f027b25EfF` |
 
 ## Configuration Reference
 
+### Monitoring
+
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `ethereum.http_rpc_url` | - | Alchemy HTTP endpoint |
-| `ethereum.ws_rpc_url` | - | Alchemy WebSocket endpoint |
-| `execution.enabled` | `true` | Enable execution |
-| `execution.dry_run` | `false` | Simulate only |
-| `execution.min_profit_eth` | `0.01` | Min profit threshold |
-| `dashboard.port` | `8080` | Dashboard port |
+| `artemis_mode` | `true` | Use Artemis architecture |
+| `mempool_enabled` | `true` | Monitor pending transactions |
+| `block_enabled` | `true` | Monitor new blocks |
+| `min_profit_eth` | `0.005` | Minimum profit threshold |
+| `max_gas_price_gwei` | `500` | Maximum gas price |
+
+### Execution
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Enable execution |
+| `dry_run` | `true` | Simulate only |
+| `use_flashbots` | `true` | Use Flashbots relay |
+| `slippage_tolerance` | `0.5` | Slippage % |
+| `max_priority_fee_gwei` | `3` | Max tip |
+
+### Simulation
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `enabled` | `true` | Enable simulation |
+| `parallel` | `true` | Parallel simulation |
+| `workers` | `4` | Simulation threads |
+| `timeout_ms` | `5000` | Simulation timeout |
+
+## Local Development
+
+### Run with Reth Node
+
+For lowest latency simulation:
+
+```bash
+# Start reth with MEV configuration
+./start-reth-mev.sh
+
+# Or manually
+reth node \
+  --http --http.api eth,net,web3,debug,trace \
+  --ws --ws.api eth,net,web3,debug,trace
+```
+
+### Deploy Contracts
+
+```bash
+cd contracts
+forge create FlashloanArbitrage \
+  --rpc-url $ETH_RPC_URL \
+  --private-key $PRIVATE_KEY
+
+forge create SandwichExecutor \
+  --rpc-url $ETH_RPC_URL \
+  --private-key $PRIVATE_KEY
+```
 
 ## Safety
 
 **Start with `dry_run = true` to monitor without executing.**
 
-- Opportunities shown are estimates until simulated
-- Gas costs vary with network congestion
-- Competition from other MEV bots is fierce
+- All opportunities are simulated before execution
+- Flashbots provides MEV protection (no failed tx on-chain)
+- Gas costs and slippage are factored into profit calculations
+- Competition from other MEV searchers is intense
 - Never risk more than you can afford to lose
 
 ## Requirements
 
-- Rust 1.70+
-- Alchemy API key (paid tier for WebSocket)
-- ~0.1 ETH for gas (execution)
-- Optional: Reth node for local simulation
+- Rust 1.75+
+- Alchemy/Infura API key (paid tier for WebSocket + mempool)
+- ETH for gas (~0.1 ETH minimum)
+- Optional: Local reth/geth node for simulation
 
 ## License
 
