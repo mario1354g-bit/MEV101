@@ -1,22 +1,22 @@
 //! Artemis-based MEV bot entry point
 //!
-//! This module provides an alternative entry point using the Artemis architecture.
+//! FOCUSED ON ONE THING: Flashloan Arbitrage
+//! - Borrow ETH via flashloan
+//! - Execute 2-4 hop swaps
+//! - Return loan + profit
+//! - No sandwiches, no liquidations, just clean arb
 
 use crate::artemis::{Engine, EngineConfig, ExecutionMode};
 use crate::collectors::{
-    BlockCollector, MempoolCollector, MempoolCollectorConfig, PoolDiscoveryCollector,
-    PoolDiscoveryConfig, SwapEventCollector, SwapEventCollectorConfig,
+    BlockCollector, PoolDiscoveryCollector, PoolDiscoveryConfig, SwapEventCollector,
+    SwapEventCollectorConfig,
 };
 use crate::executors::{FlashbotsExecutor, FlashbotsExecutorConfig};
-use crate::strategies::{
-    ArbitrageStrategy, ArbitrageStrategyConfig, DexPair, LiquidationStrategy,
-    LiquidationStrategyConfig, LongTailStrategy, LongTailStrategyConfig,
-    SandwichStrategy, SandwichStrategyConfig, TokenInfo,
-};
-use alloy::primitives::{address, Address};
+use crate::strategies::{FlashloanArbConfig, FlashloanArbStrategy, LongTailStrategy, LongTailStrategyConfig};
+use alloy::primitives::Address;
 use tracing::info;
 
-/// Run the Artemis-based MEV bot
+/// Run the Artemis-based MEV bot - FLASHLOAN ARB ONLY
 pub async fn run_artemis(
     ws_url: String,
     rpc_url: String,
@@ -24,9 +24,12 @@ pub async fn run_artemis(
     flashloan_contract: Address,
     dry_run: bool,
 ) -> eyre::Result<()> {
-    info!("Starting Artemis MEV Engine");
+    info!("================================================");
+    info!("  FLASHLOAN ARBITRAGE BOT");
+    info!("  No sandwiches. No liquidations. Just arb.");
+    info!("================================================");
 
-    // Configure engine
+    // Configure engine - lower profit threshold for more opportunities
     let engine_config = EngineConfig {
         event_buffer: 10_000,
         action_buffer: 1_000,
@@ -35,60 +38,38 @@ pub async fn run_artemis(
         } else {
             ExecutionMode::Live
         },
-        min_profit_wei: 5_000_000_000_000_000, // 0.005 ETH
+        min_profit_wei: 1_000_000_000_000_000, // 0.001 ETH (~$2.50)
     };
 
-    // Configure collectors
-    let mempool_config = MempoolCollectorConfig {
-        ws_url: ws_url.clone(),
-        fetch_full_tx: true,
-        sample_rate: 1, // Fetch EVERY tx for maximum opportunity detection
-    };
-
+    // Collectors - just what we need
     let swap_config = SwapEventCollectorConfig::mainnet_defaults(ws_url.clone());
 
-    // Configure pool discovery collector - watches for NEW pool deployments (long-tail!)
     let pool_discovery_config = PoolDiscoveryConfig {
         ws_url: ws_url.clone(),
         ..PoolDiscoveryConfig::mainnet_aggressive()
     };
 
-    // Configure strategies
-    let arb_config = ArbitrageStrategyConfig {
-        min_profit_bps: 5,
-        max_input_eth: 10.0,
-        use_flashloan: true,
-        flashloan_token: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
-        pairs: create_default_pairs(),
+    // MAIN STRATEGY: Flashloan Arbitrage
+    let flashloan_config = FlashloanArbConfig {
+        min_profit_usd: 1.0,  // Target just $1 profit
+        max_hops: 4,          // 2, 3, or 4 hop routes
+        flashloan_amounts: vec![1.0, 5.0, 10.0, 25.0, 50.0, 100.0], // ETH amounts to try
+        gas_price_gwei: 30,
+        gas_per_hop: 150_000,
+        eth_price_usd: 2500.0,
     };
 
-    let sandwich_config = SandwichStrategyConfig {
-        rpc_url: rpc_url.clone(),
-        use_revm_simulation: true,
-        ..SandwichStrategyConfig::default()
-    };
-
-    let liquidation_config = LiquidationStrategyConfig {
-        rpc_url: rpc_url.clone(),
-        min_profit_eth: 0.01,
-        health_factor_threshold: 1.1,
-        watched_accounts: vec![
-            // Add accounts to watch for liquidation
-        ],
-        use_flashloan: true,
-    };
-
-    // Configure long-tail strategy - new pools, multi-hop routes, obscure pairs
+    // BACKUP: Long-tail strategy for new pools
     let longtail_config = LongTailStrategyConfig {
         rpc_url: rpc_url.clone(),
-        min_profit_bps: 10,  // Lower threshold for long-tail (0.1%)
-        max_hops: 3,         // Up to 3-hop routes (A->B->C->A)
-        max_input_eth: 5.0,  // Conservative for long-tail
+        min_profit_bps: 10,
+        max_hops: 4,
+        max_input_eth: 50.0,
         use_flashloan: true,
         ..LongTailStrategyConfig::default()
     };
 
-    // Configure executor
+    // Configure executor with your 7 builders
     let flashbots_config = FlashbotsExecutorConfig {
         relay_url: "https://relay.flashbots.net".to_string(),
         rpc_url: rpc_url.clone(),
@@ -97,178 +78,29 @@ pub async fn run_artemis(
         dry_run,
     };
 
-    // Create executor and initialize with real wallet balance
+    // Create executor
     let executor = FlashbotsExecutor::new(flashbots_config)?;
     executor.init_simulator_balance().await?;
 
-    // Build and run engine
+    // Build engine - ONLY arbitrage strategies
     let engine = Engine::new(engine_config)
         // Collectors
-        .add_collector(MempoolCollector::new(mempool_config))
         .add_collector(BlockCollector::new(ws_url.clone()))
         .add_collector(SwapEventCollector::new(swap_config))
-        .add_collector(PoolDiscoveryCollector::new(pool_discovery_config)) // NEW: watches for new pools
-        // Strategies
-        .add_strategy(ArbitrageStrategy::new(arb_config))
-        .add_strategy(SandwichStrategy::new(sandwich_config))
-        .add_strategy(LiquidationStrategy::new(liquidation_config))
-        .add_strategy(LongTailStrategy::new(longtail_config)) // NEW: long-tail MEV
-        // Executors
+        .add_collector(PoolDiscoveryCollector::new(pool_discovery_config))
+        // Strategies - ONLY flashloan arb
+        .add_strategy(FlashloanArbStrategy::new(flashloan_config))
+        .add_strategy(LongTailStrategy::new(longtail_config))
+        // Executor
         .add_executor(executor);
 
-    info!("Artemis Engine configured, starting...");
+    info!("Bot configured:");
+    info!("  - Flashloan amounts: 1, 5, 10, 25, 50, 100 ETH");
+    info!("  - Max hops: 4");
+    info!("  - Min profit: $1");
+    info!("  - Multi-builder submission enabled");
+    info!("");
+    info!("Starting...");
+
     engine.run().await
-}
-
-/// Create default trading pairs for arbitrage - HOT POOLS
-fn create_default_pairs() -> Vec<DexPair> {
-    use crate::artemis::DexType;
-
-    let weth = TokenInfo {
-        address: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-        symbol: "WETH".to_string(),
-        decimals: 18,
-    };
-
-    let usdc = TokenInfo {
-        address: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-        symbol: "USDC".to_string(),
-        decimals: 6,
-    };
-
-    let usdt = TokenInfo {
-        address: address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
-        symbol: "USDT".to_string(),
-        decimals: 6,
-    };
-
-    let wbtc = TokenInfo {
-        address: address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"),
-        symbol: "WBTC".to_string(),
-        decimals: 8,
-    };
-
-    let dai = TokenInfo {
-        address: address!("6B175474E89094C44Da98b954EedeAC495271d0F"),
-        symbol: "DAI".to_string(),
-        decimals: 18,
-    };
-
-    let aave = TokenInfo {
-        address: address!("7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"),
-        symbol: "AAVE".to_string(),
-        decimals: 18,
-    };
-
-    vec![
-        // ========== USDC/WETH pools (highest volume) ==========
-        DexPair {
-            pool: address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"),
-            dex: DexType::UniswapV2,
-            token0: usdc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30,
-        },
-        DexPair {
-            pool: address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
-            dex: DexType::UniswapV3,
-            token0: usdc.clone(),
-            token1: weth.clone(),
-            fee_bps: 5, // 0.05%
-        },
-        DexPair {
-            pool: address!("8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"),
-            dex: DexType::UniswapV3,
-            token0: usdc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30, // 0.3%
-        },
-        DexPair {
-            pool: address!("397FF1542f962076d0BFE58eA045FfA2d347ACa0"),
-            dex: DexType::SushiSwap,
-            token0: usdc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30,
-        },
-
-        // ========== WETH/USDT pools ==========
-        DexPair {
-            pool: address!("0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"),
-            dex: DexType::UniswapV2,
-            token0: weth.clone(),
-            token1: usdt.clone(),
-            fee_bps: 30,
-        },
-        DexPair {
-            pool: address!("11b815efB8f581194ae79006d24E0d814B7697F6"),
-            dex: DexType::UniswapV3,
-            token0: weth.clone(),
-            token1: usdt.clone(),
-            fee_bps: 5, // 0.05%
-        },
-        DexPair {
-            pool: address!("4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"),
-            dex: DexType::UniswapV3,
-            token0: weth.clone(),
-            token1: usdt.clone(),
-            fee_bps: 30, // 0.3%
-        },
-
-        // ========== WBTC/WETH pools ==========
-        DexPair {
-            pool: address!("4585FE77225b41b697C938B018E2Ac67Ac5a20c0"),
-            dex: DexType::UniswapV3,
-            token0: wbtc.clone(),
-            token1: weth.clone(),
-            fee_bps: 5, // 0.05%
-        },
-        DexPair {
-            pool: address!("Cbcdf9626bC03E24f779434178A73a0B4bad62eD"),
-            dex: DexType::UniswapV3,
-            token0: wbtc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30, // 0.3%
-        },
-        DexPair {
-            pool: address!("CEfF51756c56CeFFCA006cD410B03FFC46dd3a58"),
-            dex: DexType::SushiSwap,
-            token0: wbtc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30,
-        },
-
-        // ========== WBTC/USDT pool ==========
-        DexPair {
-            pool: address!("9Db9e0e53058C89e5B94e29621a205198648425B"),
-            dex: DexType::UniswapV3,
-            token0: wbtc.clone(),
-            token1: usdt.clone(),
-            fee_bps: 30, // 0.3%
-        },
-
-        // ========== AAVE pools ==========
-        DexPair {
-            pool: address!("5aB53EE1d50eeF2C1DD3d5402789cd27bB52c1bB"),
-            dex: DexType::UniswapV3,
-            token0: aave.clone(),
-            token1: weth.clone(),
-            fee_bps: 30, // 0.3%
-        },
-
-        // ========== DAI/USDC/USDT (stablecoin arb) ==========
-        DexPair {
-            pool: address!("6c6Bc977E13Df9b0de53b251522280BB72383700"),
-            dex: DexType::UniswapV3,
-            token0: dai.clone(),
-            token1: usdc.clone(),
-            fee_bps: 1, // 0.01%
-        },
-        DexPair {
-            pool: address!("AE461cA67B15dc8dc81CE7615e0320dA1A9aB8D5"),
-            dex: DexType::UniswapV2,
-            token0: dai.clone(),
-            token1: usdc.clone(),
-            fee_bps: 30,
-        },
-    ]
 }
