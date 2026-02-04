@@ -1,5 +1,6 @@
 mod artemis;
 mod artemis_main;
+mod chains;
 mod collectors;
 mod config;
 mod dex;

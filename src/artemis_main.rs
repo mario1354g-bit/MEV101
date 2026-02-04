@@ -4,13 +4,14 @@
 
 use crate::artemis::{Engine, EngineConfig, ExecutionMode};
 use crate::collectors::{
-    BlockCollector, MempoolCollector, MempoolCollectorConfig, SwapEventCollector,
-    SwapEventCollectorConfig,
+    BlockCollector, LiquidationCollector, LiquidationCollectorConfig, MempoolCollector,
+    MempoolCollectorConfig, SwapEventCollector, SwapEventCollectorConfig,
 };
 use crate::executors::{FlashbotsExecutor, FlashbotsExecutorConfig};
 use crate::strategies::{
-    ArbitrageStrategy, ArbitrageStrategyConfig, DexPair, LiquidationStrategy,
-    LiquidationStrategyConfig, SandwichStrategy, SandwichStrategyConfig, TokenInfo,
+    ArbitrageStrategy, ArbitrageStrategyConfig, LiquidationStrategy,
+    LiquidationStrategyConfig, SandwichStrategy, SandwichStrategyConfig,
+    create_trending_pairs,
 };
 use alloy::primitives::{address, Address};
 use tracing::info;
@@ -46,13 +47,24 @@ pub async fn run_artemis(
 
     let swap_config = SwapEventCollectorConfig::mainnet_defaults(ws_url.clone());
 
-    // Configure strategies
+    // Configure liquidation collector - monitors Aave/Compound for at-risk borrowers
+    let liquidation_collector_config = LiquidationCollectorConfig {
+        ws_url: ws_url.clone(),
+        http_url: rpc_url.clone(),
+        health_threshold: 1.1, // Alert when HF drops below 1.1
+        min_debt_usd: 1000.0,  // Only track positions > $1000
+        seed_accounts: true,   // Seed with known accounts on startup
+        track_aave: true,
+        track_compound: true,
+    };
+
+    // Configure strategies with 500+ trending pairs
     let arb_config = ArbitrageStrategyConfig {
         min_profit_bps: 5,
         max_input_eth: 10.0,
         use_flashloan: true,
         flashloan_token: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"), // WETH
-        pairs: create_default_pairs(),
+        pairs: create_trending_pairs(), // 500+ trending pairs including top 50
     };
 
     let sandwich_config = SandwichStrategyConfig {
@@ -90,6 +102,7 @@ pub async fn run_artemis(
         .add_collector(MempoolCollector::new(mempool_config))
         .add_collector(BlockCollector::new(ws_url.clone()))
         .add_collector(SwapEventCollector::new(swap_config))
+        .add_collector(LiquidationCollector::new(liquidation_collector_config))
         // Strategies
         .add_strategy(ArbitrageStrategy::new(arb_config))
         .add_strategy(SandwichStrategy::new(sandwich_config))
@@ -99,157 +112,4 @@ pub async fn run_artemis(
 
     info!("Artemis Engine configured, starting...");
     engine.run().await
-}
-
-/// Create default trading pairs for arbitrage - HOT POOLS
-fn create_default_pairs() -> Vec<DexPair> {
-    use crate::artemis::DexType;
-
-    let weth = TokenInfo {
-        address: address!("C02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"),
-        symbol: "WETH".to_string(),
-        decimals: 18,
-    };
-
-    let usdc = TokenInfo {
-        address: address!("A0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"),
-        symbol: "USDC".to_string(),
-        decimals: 6,
-    };
-
-    let usdt = TokenInfo {
-        address: address!("dAC17F958D2ee523a2206206994597C13D831ec7"),
-        symbol: "USDT".to_string(),
-        decimals: 6,
-    };
-
-    let wbtc = TokenInfo {
-        address: address!("2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"),
-        symbol: "WBTC".to_string(),
-        decimals: 8,
-    };
-
-    let dai = TokenInfo {
-        address: address!("6B175474E89094C44Da98b954EedeAC495271d0F"),
-        symbol: "DAI".to_string(),
-        decimals: 18,
-    };
-
-    let aave = TokenInfo {
-        address: address!("7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"),
-        symbol: "AAVE".to_string(),
-        decimals: 18,
-    };
-
-    vec![
-        // ========== USDC/WETH pools (highest volume) ==========
-        DexPair {
-            pool: address!("B4e16d0168e52d35CaCD2c6185b44281Ec28C9Dc"),
-            dex: DexType::UniswapV2,
-            token0: usdc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30,
-        },
-        DexPair {
-            pool: address!("88e6A0c2dDD26FEEb64F039a2c41296FcB3f5640"),
-            dex: DexType::UniswapV3,
-            token0: usdc.clone(),
-            token1: weth.clone(),
-            fee_bps: 5, // 0.05%
-        },
-        DexPair {
-            pool: address!("8ad599c3A0ff1De082011EFDDc58f1908eb6e6D8"),
-            dex: DexType::UniswapV3,
-            token0: usdc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30, // 0.3%
-        },
-        DexPair {
-            pool: address!("397FF1542f962076d0BFE58eA045FfA2d347ACa0"),
-            dex: DexType::SushiSwap,
-            token0: usdc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30,
-        },
-
-        // ========== WETH/USDT pools ==========
-        DexPair {
-            pool: address!("0d4a11d5EEaaC28EC3F61d100daF4d40471f1852"),
-            dex: DexType::UniswapV2,
-            token0: weth.clone(),
-            token1: usdt.clone(),
-            fee_bps: 30,
-        },
-        DexPair {
-            pool: address!("11b815efB8f581194ae79006d24E0d814B7697F6"),
-            dex: DexType::UniswapV3,
-            token0: weth.clone(),
-            token1: usdt.clone(),
-            fee_bps: 5, // 0.05%
-        },
-        DexPair {
-            pool: address!("4e68Ccd3E89f51C3074ca5072bbAC773960dFa36"),
-            dex: DexType::UniswapV3,
-            token0: weth.clone(),
-            token1: usdt.clone(),
-            fee_bps: 30, // 0.3%
-        },
-
-        // ========== WBTC/WETH pools ==========
-        DexPair {
-            pool: address!("4585FE77225b41b697C938B018E2Ac67Ac5a20c0"),
-            dex: DexType::UniswapV3,
-            token0: wbtc.clone(),
-            token1: weth.clone(),
-            fee_bps: 5, // 0.05%
-        },
-        DexPair {
-            pool: address!("Cbcdf9626bC03E24f779434178A73a0B4bad62eD"),
-            dex: DexType::UniswapV3,
-            token0: wbtc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30, // 0.3%
-        },
-        DexPair {
-            pool: address!("CEfF51756c56CeFFCA006cD410B03FFC46dd3a58"),
-            dex: DexType::SushiSwap,
-            token0: wbtc.clone(),
-            token1: weth.clone(),
-            fee_bps: 30,
-        },
-
-        // ========== WBTC/USDT pool ==========
-        DexPair {
-            pool: address!("9Db9e0e53058C89e5B94e29621a205198648425B"),
-            dex: DexType::UniswapV3,
-            token0: wbtc.clone(),
-            token1: usdt.clone(),
-            fee_bps: 30, // 0.3%
-        },
-
-        // ========== AAVE pools ==========
-        DexPair {
-            pool: address!("5aB53EE1d50eeF2C1DD3d5402789cd27bB52c1bB"),
-            dex: DexType::UniswapV3,
-            token0: aave.clone(),
-            token1: weth.clone(),
-            fee_bps: 30, // 0.3%
-        },
-
-        // ========== DAI/USDC/USDT (stablecoin arb) ==========
-        DexPair {
-            pool: address!("6c6Bc977E13Df9b0de53b251522280BB72383700"),
-            dex: DexType::UniswapV3,
-            token0: dai.clone(),
-            token1: usdc.clone(),
-            fee_bps: 1, // 0.01%
-        },
-        DexPair {
-            pool: address!("AE461cA67B15dc8dc81CE7615e0320dA1A9aB8D5"),
-            dex: DexType::UniswapV2,
-            token0: dai.clone(),
-            token1: usdc.clone(),
-            fee_bps: 30,
-        },
-    ]
 }

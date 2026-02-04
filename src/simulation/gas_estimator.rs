@@ -80,7 +80,7 @@ where
             cached_base_fee: tokio::sync::RwLock::new(None),
             cached_priority_fee: tokio::sync::RwLock::new(None),
             cache_ttl_secs: 12, // Roughly 1 block
-            builder_tip_percentage: 90, // 90% of profit to builder
+            builder_tip_percentage: 99, // 99% of profit to builder (aggressive bidding)
             _transport: std::marker::PhantomData,
         }
     }
@@ -93,7 +93,7 @@ where
             cached_base_fee: tokio::sync::RwLock::new(None),
             cached_priority_fee: tokio::sync::RwLock::new(None),
             cache_ttl_secs: 12,
-            builder_tip_percentage: 90,
+            builder_tip_percentage: 99, // 99% bribe
             _transport: std::marker::PhantomData,
         }
     }

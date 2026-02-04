@@ -6,10 +6,10 @@
 # Ethereum Network Configuration
 [ethereum]
 # Primary HTTP RPC endpoint - Alchemy (supports mempool subscriptions)
-http_rpc_url = "https://eth-mainnet.g.alchemy.com/v2/4Lkxgt7ISPaJFuHh-_3vn"
+http_rpc_url = "https://eth-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
 
 # Primary WebSocket RPC endpoint - Alchemy for real-time subscriptions
-ws_rpc_url = "wss://eth-mainnet.g.alchemy.com/v2/4Lkxgt7ISPaJFuHh-_3vn"
+ws_rpc_url = "wss://eth-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
 
 # Fallback HTTP RPC endpoint - Local reth node
 fallback_http_url = "http://localhost:8545"
@@ -208,3 +208,77 @@ WBTC = "0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599"
 DAI = "0x6B175474E89094C44Da98b954EesdfeDe35CE"
 AAVE = "0x7Fc66500c84A76Ad7e9c93437bFc5Ac33E2DDaE9"
 USDP = "0x8E870D67F660D95d5be530380D0eC0bd388289E1"
+
+# ============================================================
+# L2 CHAIN CONFIGURATIONS - Less competitive MEV opportunities
+# ============================================================
+
+# L2 Monitoring Configuration
+[l2]
+# Enable L2 monitoring (runs alongside mainnet)
+enabled = true
+
+# Which L2s to monitor (comma-separated)
+# Options: arbitrum, optimism, base, zksync, scroll, polygon
+active_chains = ["arbitrum", "base", "optimism"]
+
+# Arbitrum One - Medium competition, highest L2 volume
+[l2.arbitrum]
+enabled = true
+chain_id = 42161
+http_rpc_url = "https://arb-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
+ws_rpc_url = "wss://arb-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
+# Key DEXes: Uniswap V3, Camelot, SushiSwap, GMX
+min_profit_usd = 1.0  # Lower threshold due to cheap gas
+block_time_ms = 250
+
+# Optimism - Low competition, Velodrome dominant
+[l2.optimism]
+enabled = true
+chain_id = 10
+http_rpc_url = "https://opt-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
+ws_rpc_url = "wss://opt-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
+# Key DEXes: Uniswap V3, Velodrome
+min_profit_usd = 0.5
+block_time_ms = 2000
+
+# Base - Lowest competition, fast growing, meme coins
+[l2.base]
+enabled = true
+chain_id = 8453
+http_rpc_url = "https://base-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
+ws_rpc_url = "wss://base-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
+# Key DEXes: Uniswap V3, Aerodrome, BaseSwap
+# Hot tokens: DEGEN, BRETT, TOSHI
+min_profit_usd = 0.25  # Very low threshold
+block_time_ms = 2000
+
+# zkSync Era - Very low competition, unique architecture
+[l2.zksync]
+enabled = false  # Enable when ready
+chain_id = 324
+http_rpc_url = "https://mainnet.era.zksync.io"
+ws_rpc_url = "wss://mainnet.era.zksync.io/ws"
+# Key DEXes: SyncSwap, Mute.io, SpaceFi
+min_profit_usd = 0.25
+block_time_ms = 1000
+
+# Scroll - Nascent ecosystem, very low competition
+[l2.scroll]
+enabled = false  # Enable when ready
+chain_id = 534352
+http_rpc_url = "https://rpc.scroll.io"
+ws_rpc_url = "wss://rpc.scroll.io"
+# Key DEXes: SushiSwap, Ambient
+min_profit_usd = 0.25
+block_time_ms = 3000
+
+# Polygon PoS - Medium competition, high volume
+[l2.polygon]
+enabled = false  # Enable when ready
+chain_id = 137
+http_rpc_url = "https://polygon-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
+ws_rpc_url = "wss://polygon-mainnet.g.alchemy.com/v2/lg4VigKRWqsPaOYbkiVZVTw9xKTsmrFU"
+# Key DEXes: Uniswap V3, QuickSwap, SushiSwap
+min_profit_usd = 0.5
+block_time_ms = 2000
