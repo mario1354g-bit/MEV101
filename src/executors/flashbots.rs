@@ -307,12 +307,20 @@ impl FlashbotsExecutor {
         // Serialize request body
         let body = serde_json::to_string(&request)?;
 
-        // Flashbots signature: sign(keccak256(body)) with EIP-191 personal_sign
+        // Flashbots signature: sign(hex(keccak256(body))) with EIP-191 personal_sign
+        // Reference: https://docs.flashbots.net/flashbots-auction/advanced/rpc-endpoint
+        // The JS implementation does: wallet.signMessage(id(body)) where id() returns hex string
+
         // 1. Hash the body first
         let body_hash = keccak256(body.as_bytes());
 
-        // 2. Sign the hash (sign_message_sync adds EIP-191 prefix internally)
-        let signature = signer.sign_message_sync(body_hash.as_slice())
+        // 2. Convert hash to hex string with 0x prefix (this is what Flashbots expects!)
+        // The hex string is 66 chars: "0x" + 64 hex chars
+        let body_hash_hex = format!("0x{}", hex::encode(body_hash));
+
+        // 3. Sign the hex STRING (not raw bytes) - sign_message_sync adds EIP-191 prefix
+        // This creates: sign(keccak256("\x19Ethereum Signed Message:\n66" + body_hash_hex))
+        let signature = signer.sign_message_sync(body_hash_hex.as_bytes())
             .map_err(|e| eyre::eyre!("Failed to sign flashbots header: {}", e))?;
 
         // Get signature bytes and ensure v is 27/28 (legacy/rpc standard)
@@ -330,12 +338,12 @@ impl FlashbotsExecutor {
         );
 
         info!(
-            "Flashbots sig debug: body_len={}, body_hash=0x{}, addr={}, sig_v={}, header={}",
+            "Flashbots sig debug: body_len={}, hash_hex={}, addr={}, sig_v={}, header_len={}",
             body.len(),
-            hex::encode(body_hash),
+            body_hash_hex,
             signer.address(),
             sig_bytes[64],
-            sig_header
+            sig_header.len()
         );
 
         debug!(
