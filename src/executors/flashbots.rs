@@ -24,6 +24,17 @@ pub mod endpoints {
     pub const FLASHBOTS_MAINNET: &str = "https://relay.flashbots.net";
     pub const FLASHBOTS_GOERLI: &str = "https://relay-goerli.flashbots.net";
     pub const FLASHBOTS_PROTECT: &str = "https://rpc.flashbots.net";
+
+    /// All block builders to submit bundles to (increases inclusion rate)
+    pub const ALL_BUILDERS: &[&str] = &[
+        "https://relay.flashbots.net",
+        "https://rpc.titanbuilder.xyz",
+        "https://builder0x69.io",
+        "https://rpc.beaverbuild.org",
+        "https://rpc.lokibuilder.xyz",
+        "https://rpc.lightspeedbuilder.info",
+        "https://eth.zkbob.io",
+    ];
 }
 
 /// Flashbots bundle request
@@ -382,6 +393,169 @@ impl FlashbotsExecutor {
             .ok_or_else(|| eyre::eyre!("No result in Flashbots response"))
     }
 
+    /// Submit bundle to a specific builder endpoint
+    async fn submit_bundle_to_builder(
+        &self,
+        builder_url: &str,
+        txs: Vec<String>,
+        target_block: u64,
+        sig_header: &str,
+    ) -> eyre::Result<BundleResult> {
+        let bundle = FlashbotsBundle {
+            txs,
+            block_number: format!("0x{:x}", target_block),
+            min_timestamp: None,
+            max_timestamp: None,
+        };
+
+        let request = SendBundleParams {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            method: "eth_sendBundle".to_string(),
+            params: vec![bundle],
+        };
+
+        let body = serde_json::to_string(&request)?;
+
+        let response = self
+            .client
+            .post(builder_url)
+            .header("Content-Type", "application/json")
+            .header("X-Flashbots-Signature", sig_header)
+            .timeout(std::time::Duration::from_secs(2))
+            .body(body)
+            .send()
+            .await?;
+
+        let status = response.status();
+        let response_text = response.text().await?;
+
+        if !status.is_success() {
+            return Err(eyre::eyre!("HTTP {}: {}", status, response_text));
+        }
+
+        let bundle_response: BundleResponse = serde_json::from_str(&response_text)?;
+
+        if let Some(error) = bundle_response.error {
+            return Err(eyre::eyre!("{}", error.message));
+        }
+
+        bundle_response.result.ok_or_else(|| eyre::eyre!("No result"))
+    }
+
+    /// Submit bundle to ALL builders in parallel
+    async fn submit_bundle_to_all_builders(
+        &self,
+        txs: Vec<String>,
+        target_block: u64,
+    ) -> Vec<(String, eyre::Result<BundleResult>)> {
+        let signer = match self.signer.as_ref() {
+            Some(s) => s,
+            None => return vec![("none".to_string(), Err(eyre::eyre!("No signer")))],
+        };
+
+        // Build the signature once (same for all builders)
+        let bundle = FlashbotsBundle {
+            txs: txs.clone(),
+            block_number: format!("0x{:x}", target_block),
+            min_timestamp: None,
+            max_timestamp: None,
+        };
+
+        let request = SendBundleParams {
+            jsonrpc: "2.0".to_string(),
+            id: 1,
+            method: "eth_sendBundle".to_string(),
+            params: vec![bundle],
+        };
+
+        let body = match serde_json::to_string(&request) {
+            Ok(b) => b,
+            Err(e) => return vec![("json".to_string(), Err(e.into()))],
+        };
+
+        let body_hash = keccak256(body.as_bytes());
+        let body_hash_hex = format!("0x{}", hex::encode(body_hash));
+
+        let signature = match signer.sign_message_sync(body_hash_hex.as_bytes()) {
+            Ok(s) => s,
+            Err(e) => return vec![("sign".to_string(), Err(eyre::eyre!("{}", e)))],
+        };
+
+        let mut sig_bytes = signature.as_bytes().to_vec();
+        if sig_bytes[64] < 27 {
+            sig_bytes[64] += 27;
+        }
+
+        let sig_header = format!("{:#x}:0x{}", signer.address(), hex::encode(&sig_bytes));
+
+        // Submit to all builders in parallel
+        let mut handles = Vec::new();
+
+        for builder_url in endpoints::ALL_BUILDERS {
+            let client = self.client.clone();
+            let txs_clone = txs.clone();
+            let sig_header_clone = sig_header.clone();
+            let builder_url_string = builder_url.to_string();
+
+            let handle = tokio::spawn(async move {
+                let bundle = FlashbotsBundle {
+                    txs: txs_clone,
+                    block_number: format!("0x{:x}", target_block),
+                    min_timestamp: None,
+                    max_timestamp: None,
+                };
+
+                let request = SendBundleParams {
+                    jsonrpc: "2.0".to_string(),
+                    id: 1,
+                    method: "eth_sendBundle".to_string(),
+                    params: vec![bundle],
+                };
+
+                let body = serde_json::to_string(&request)?;
+
+                let response = client
+                    .post(&builder_url_string)
+                    .header("Content-Type", "application/json")
+                    .header("X-Flashbots-Signature", &sig_header_clone)
+                    .timeout(std::time::Duration::from_secs(2))
+                    .body(body)
+                    .send()
+                    .await?;
+
+                let status = response.status();
+                let response_text = response.text().await?;
+
+                if !status.is_success() {
+                    return Err(eyre::eyre!("HTTP {}", status));
+                }
+
+                let bundle_response: BundleResponse = serde_json::from_str(&response_text)?;
+
+                if let Some(error) = bundle_response.error {
+                    return Err(eyre::eyre!("{}", error.message));
+                }
+
+                bundle_response.result.ok_or_else(|| eyre::eyre!("No result"))
+            });
+
+            handles.push((builder_url.to_string(), handle));
+        }
+
+        // Collect results
+        let mut results = Vec::new();
+        for (builder, handle) in handles {
+            let result = match handle.await {
+                Ok(r) => r,
+                Err(e) => Err(eyre::eyre!("Task failed: {}", e)),
+            };
+            results.push((builder, result));
+        }
+
+        results
+    }
+
     /// Build flashloan arbitrage transaction
     async fn build_flashloan_arb_tx(
         &self,
@@ -676,26 +850,50 @@ impl Executor for FlashbotsExecutor {
             "Submitting bundle to Flashbots"
         );
 
-        match self.submit_bundle(signed_txs, target_block).await {
-            Ok(result) => {
-                info!(
-                    bundle_hash = %result.bundle_hash,
-                    "Bundle submitted successfully"
-                );
-                Ok(ExecutionResult::Success {
-                    action_id,
-                    tx_hash: B256::ZERO, // Bundle hash, not tx hash
-                    profit,
-                    gas_used: 0, // Unknown until included
+        // Submit to ALL builders in parallel for higher inclusion rate
+        let results = self.submit_bundle_to_all_builders(signed_txs, target_block).await;
+
+        // Check if at least one builder accepted
+        let successful: Vec<_> = results.iter()
+            .filter_map(|(builder, result)| {
+                match result {
+                    Ok(r) => Some((builder.as_str(), r.bundle_hash.clone())),
+                    Err(_) => None,
+                }
+            })
+            .collect();
+
+        let failed_count = results.len() - successful.len();
+
+        if !successful.is_empty() {
+            info!(
+                accepted_by = successful.len(),
+                failed = failed_count,
+                bundle_hash = %successful[0].1,
+                builders = ?successful.iter().map(|(b, _)| *b).collect::<Vec<_>>(),
+                "Bundle submitted to multiple builders"
+            );
+            Ok(ExecutionResult::Success {
+                action_id,
+                tx_hash: B256::ZERO, // Bundle hash, not tx hash
+                profit,
+                gas_used: 0, // Unknown until included
+            })
+        } else {
+            let errors: Vec<_> = results.iter()
+                .filter_map(|(builder, result)| {
+                    match result {
+                        Err(e) => Some(format!("{}: {}", builder, e)),
+                        Ok(_) => None,
+                    }
                 })
-            }
-            Err(e) => {
-                error!("Bundle submission failed: {}", e);
-                Ok(ExecutionResult::Failed {
-                    action_id,
-                    reason: e.to_string(),
-                })
-            }
+                .take(3)
+                .collect();
+            error!("All builders rejected bundle: {:?}", errors);
+            Ok(ExecutionResult::Failed {
+                action_id,
+                reason: format!("All {} builders rejected", results.len()),
+            })
         }
     }
 }
