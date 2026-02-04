@@ -71,6 +71,67 @@ sol! {
     ) external;
 }
 
+// Uniswap V3 SwapRouter ABI definitions (separate sol! block for struct support)
+sol! {
+    // V3 ExactInputSingle params struct
+    #[derive(Debug)]
+    struct ExactInputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    // V3 ExactInput params struct (multi-hop)
+    #[derive(Debug)]
+    struct ExactInputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountIn;
+        uint256 amountOutMinimum;
+    }
+
+    // V3 ExactOutputSingle params struct
+    #[derive(Debug)]
+    struct ExactOutputSingleParams {
+        address tokenIn;
+        address tokenOut;
+        uint24 fee;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+        uint160 sqrtPriceLimitX96;
+    }
+
+    // V3 ExactOutput params struct (multi-hop)
+    #[derive(Debug)]
+    struct ExactOutputParams {
+        bytes path;
+        address recipient;
+        uint256 deadline;
+        uint256 amountOut;
+        uint256 amountInMaximum;
+    }
+
+    #[derive(Debug)]
+    function exactInputSingle(ExactInputSingleParams calldata params) external payable returns (uint256 amountOut);
+
+    #[derive(Debug)]
+    function exactInput(ExactInputParams calldata params) external payable returns (uint256 amountOut);
+
+    #[derive(Debug)]
+    function exactOutputSingle(ExactOutputSingleParams calldata params) external payable returns (uint256 amountIn);
+
+    #[derive(Debug)]
+    function exactOutput(ExactOutputParams calldata params) external payable returns (uint256 amountIn);
+}
+
 /// Known DEX router addresses
 pub mod routers {
     use alloy::primitives::{address, Address};
@@ -410,6 +471,54 @@ impl SandwichStrategy {
                 let token_in = path.first().copied().unwrap_or(Address::ZERO);
                 let token_out = path.last().copied().unwrap_or(Address::ZERO);
                 return (decoded.amountIn, decoded.amountOutMin, token_in, token_out);
+            }
+        }
+
+        // ============== Uniswap V3 SwapRouter ==============
+
+        // exactInputSingle - single hop V3 swap
+        if *selector == selectors::EXACT_INPUT_SINGLE {
+            if let Ok(decoded) = exactInputSingleCall::abi_decode(&bytes, true) {
+                let params = decoded.params;
+                let amount_in = if value > U256::ZERO { value } else { params.amountIn };
+                return (amount_in, params.amountOutMinimum, params.tokenIn, params.tokenOut);
+            }
+        }
+
+        // exactInput - multi-hop V3 swap (path is encoded bytes)
+        if *selector == selectors::EXACT_INPUT {
+            if let Ok(decoded) = exactInputCall::abi_decode(&bytes, true) {
+                let params = decoded.params;
+                let path_bytes = params.path.as_ref();
+                // V3 path encoding: tokenIn (20 bytes) + fee (3 bytes) + tokenOut (20 bytes) [+ more hops]
+                if path_bytes.len() >= 43 {
+                    let token_in = Address::from_slice(&path_bytes[0..20]);
+                    let token_out = Address::from_slice(&path_bytes[path_bytes.len() - 20..]);
+                    let amount_in = if value > U256::ZERO { value } else { params.amountIn };
+                    return (amount_in, params.amountOutMinimum, token_in, token_out);
+                }
+            }
+        }
+
+        // exactOutputSingle - single hop V3 swap (exact output)
+        if *selector == selectors::EXACT_OUTPUT_SINGLE {
+            if let Ok(decoded) = exactOutputSingleCall::abi_decode(&bytes, true) {
+                let params = decoded.params;
+                return (params.amountInMaximum, params.amountOut, params.tokenIn, params.tokenOut);
+            }
+        }
+
+        // exactOutput - multi-hop V3 swap (exact output, path is reversed)
+        if *selector == selectors::EXACT_OUTPUT {
+            if let Ok(decoded) = exactOutputCall::abi_decode(&bytes, true) {
+                let params = decoded.params;
+                let path_bytes = params.path.as_ref();
+                // V3 exactOutput path is REVERSED: tokenOut first, tokenIn last
+                if path_bytes.len() >= 43 {
+                    let token_out = Address::from_slice(&path_bytes[0..20]);
+                    let token_in = Address::from_slice(&path_bytes[path_bytes.len() - 20..]);
+                    return (params.amountInMaximum, params.amountOut, token_in, token_out);
+                }
             }
         }
 
