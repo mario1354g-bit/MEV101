@@ -125,9 +125,9 @@ impl FlashbotsExecutor {
             let bot_address = signer.address();
 
             let balance = if self.config.dry_run {
-                // Use simulated balance for dry run (2 ETH)
-                let sim_balance = U256::from(2_000_000_000_000_000_000u128); // 2 ETH
-                info!("Simulator: Using simulated balance 2 ETH for {} (dry run)", bot_address);
+                // Use simulated balance for dry run (5 ETH)
+                let sim_balance = U256::from(5_000_000_000_000_000_000u128); // 5 ETH
+                info!("Simulator: Using simulated balance 5 ETH for {} (dry run)", bot_address);
                 sim_balance
             } else {
                 // Fetch real balance from chain for live mode
@@ -307,13 +307,13 @@ impl FlashbotsExecutor {
         // Serialize request body
         let body = serde_json::to_string(&request)?;
 
-        // Flashbots expects eth_sign style: sign(keccak256("\x19Ethereum Signed Message:\n" + len + body))
-        // sign_message_sync handles the EIP-191 prefix internally
-        let signature = signer.sign_message_sync(body.as_bytes())
-            .map_err(|e| eyre::eyre!("Failed to sign flashbots header: {}", e))?;
-
-        // For debug - compute the hash that will be displayed
+        // Flashbots signature: sign(keccak256(body)) with EIP-191 personal_sign
+        // 1. Hash the body first
         let body_hash = keccak256(body.as_bytes());
+
+        // 2. Sign the hash (sign_message_sync adds EIP-191 prefix internally)
+        let signature = signer.sign_message_sync(body_hash.as_slice())
+            .map_err(|e| eyre::eyre!("Failed to sign flashbots header: {}", e))?;
 
         // Get signature bytes and ensure v is 27/28 (legacy/rpc standard)
         let mut sig_bytes = signature.as_bytes().to_vec();
