@@ -2,8 +2,10 @@
 
 pub mod arbitrage;
 pub mod liquidation;
+pub mod longtail;
 pub mod sandwich;
 
 pub use arbitrage::{ArbitrageStrategy, ArbitrageStrategyConfig, DexPair, TokenInfo};
 pub use liquidation::{LiquidationStrategy, LiquidationStrategyConfig};
+pub use longtail::{LongTailStrategy, LongTailStrategyConfig};
 pub use sandwich::{SandwichStrategy, SandwichStrategyConfig};

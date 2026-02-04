@@ -4,13 +4,14 @@
 
 use crate::artemis::{Engine, EngineConfig, ExecutionMode};
 use crate::collectors::{
-    BlockCollector, MempoolCollector, MempoolCollectorConfig, SwapEventCollector,
-    SwapEventCollectorConfig,
+    BlockCollector, MempoolCollector, MempoolCollectorConfig, PoolDiscoveryCollector,
+    PoolDiscoveryConfig, SwapEventCollector, SwapEventCollectorConfig,
 };
 use crate::executors::{FlashbotsExecutor, FlashbotsExecutorConfig};
 use crate::strategies::{
     ArbitrageStrategy, ArbitrageStrategyConfig, DexPair, LiquidationStrategy,
-    LiquidationStrategyConfig, SandwichStrategy, SandwichStrategyConfig, TokenInfo,
+    LiquidationStrategyConfig, LongTailStrategy, LongTailStrategyConfig,
+    SandwichStrategy, SandwichStrategyConfig, TokenInfo,
 };
 use alloy::primitives::{address, Address};
 use tracing::info;
@@ -46,6 +47,12 @@ pub async fn run_artemis(
 
     let swap_config = SwapEventCollectorConfig::mainnet_defaults(ws_url.clone());
 
+    // Configure pool discovery collector - watches for NEW pool deployments (long-tail!)
+    let pool_discovery_config = PoolDiscoveryConfig {
+        ws_url: ws_url.clone(),
+        ..PoolDiscoveryConfig::mainnet_aggressive()
+    };
+
     // Configure strategies
     let arb_config = ArbitrageStrategyConfig {
         min_profit_bps: 5,
@@ -71,6 +78,16 @@ pub async fn run_artemis(
         use_flashloan: true,
     };
 
+    // Configure long-tail strategy - new pools, multi-hop routes, obscure pairs
+    let longtail_config = LongTailStrategyConfig {
+        rpc_url: rpc_url.clone(),
+        min_profit_bps: 10,  // Lower threshold for long-tail (0.1%)
+        max_hops: 3,         // Up to 3-hop routes (A->B->C->A)
+        max_input_eth: 5.0,  // Conservative for long-tail
+        use_flashloan: true,
+        ..LongTailStrategyConfig::default()
+    };
+
     // Configure executor
     let flashbots_config = FlashbotsExecutorConfig {
         relay_url: "https://relay.flashbots.net".to_string(),
@@ -90,10 +107,12 @@ pub async fn run_artemis(
         .add_collector(MempoolCollector::new(mempool_config))
         .add_collector(BlockCollector::new(ws_url.clone()))
         .add_collector(SwapEventCollector::new(swap_config))
+        .add_collector(PoolDiscoveryCollector::new(pool_discovery_config)) // NEW: watches for new pools
         // Strategies
         .add_strategy(ArbitrageStrategy::new(arb_config))
         .add_strategy(SandwichStrategy::new(sandwich_config))
         .add_strategy(LiquidationStrategy::new(liquidation_config))
+        .add_strategy(LongTailStrategy::new(longtail_config)) // NEW: long-tail MEV
         // Executors
         .add_executor(executor);
 

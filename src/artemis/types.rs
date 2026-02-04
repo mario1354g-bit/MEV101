@@ -20,6 +20,8 @@ pub enum Event {
     Liquidation(LiquidationEvent),
     /// Price update from DEX
     PriceUpdate(PriceUpdateEvent),
+    /// New pool deployed (long-tail opportunity!)
+    NewPool(NewPoolEvent),
 }
 
 /// Pending transaction from mempool
@@ -74,6 +76,19 @@ pub struct PriceUpdateEvent {
     pub price: f64,
     pub liquidity: U256,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// New pool deployment event (for long-tail MEV)
+#[derive(Debug, Clone)]
+pub struct NewPoolEvent {
+    pub pool: Address,
+    pub dex: DexType,
+    pub token0: Address,
+    pub token1: Address,
+    pub fee_bps: u32,
+    /// Is this a priority pair (involves WETH, USDC, etc.)?
+    pub is_priority: bool,
+    pub block_number: u64,
 }
 
 /// DEX types supported
