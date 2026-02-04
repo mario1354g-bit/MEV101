@@ -1,0 +1,409 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>MEV101 Dashboard</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>MEV101 Dashboard</h1>
+            <div class="status-badge" id="bot-status">
+                <span class="status-dot"></span>
+                <span class="status-text">Loading...</span>
+            </div>
+        </header>
+
+        <!-- Top Stats Row -->
+        <div class="top-stats">
+            <div class="top-stat">
+                <span class="top-stat-value" id="current-block">-</span>
+                <span class="top-stat-label">Block</span>
+            </div>
+            <div class="top-stat">
+                <span class="top-stat-value" id="base-fee">-</span>
+                <span class="top-stat-label">Base Fee (gwei)</span>
+            </div>
+            <div class="top-stat">
+                <span class="top-stat-value" id="events-processed">0</span>
+                <span class="top-stat-label">Events</span>
+            </div>
+            <div class="top-stat">
+                <span class="top-stat-value" id="total-actions">0</span>
+                <span class="top-stat-label">Actions</span>
+            </div>
+            <div class="top-stat highlight">
+                <span class="top-stat-value" id="total-profit">0.000</span>
+                <span class="top-stat-label">Profit (ETH)</span>
+            </div>
+        </div>
+
+        <!-- Action Breakdown -->
+        <section class="card action-breakdown">
+            <h2>Action Breakdown</h2>
+            <div class="action-grid">
+                <!-- Arbitrage -->
+                <div class="action-card arb">
+                    <div class="action-header">
+                        <span class="action-icon">⚡</span>
+                        <span class="action-title">Arbitrage</span>
+                    </div>
+                    <div class="action-stats">
+                        <div class="action-main">
+                            <span class="action-count" id="arb-count">0</span>
+                            <span class="action-label">executed</span>
+                        </div>
+                        <div class="action-details">
+                            <div class="action-detail">
+                                <span class="detail-value" id="arb-found">0</span>
+                                <span class="detail-label">found</span>
+                            </div>
+                            <div class="action-detail">
+                                <span class="detail-value" id="arb-failed">0</span>
+                                <span class="detail-label">failed</span>
+                            </div>
+                            <div class="action-detail profit">
+                                <span class="detail-value" id="arb-profit">0.000</span>
+                                <span class="detail-label">ETH</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="action-bar">
+                        <div class="action-bar-fill" id="arb-bar"></div>
+                    </div>
+                </div>
+
+                <!-- Sandwich -->
+                <div class="action-card sandwich">
+                    <div class="action-header">
+                        <span class="action-icon">🥪</span>
+                        <span class="action-title">Sandwich</span>
+                    </div>
+                    <div class="action-stats">
+                        <div class="action-main">
+                            <span class="action-count" id="sandwich-count">0</span>
+                            <span class="action-label">executed</span>
+                        </div>
+                        <div class="action-details">
+                            <div class="action-detail">
+                                <span class="detail-value" id="sandwich-found">0</span>
+                                <span class="detail-label">found</span>
+                            </div>
+                            <div class="action-detail">
+                                <span class="detail-value" id="sandwich-failed">0</span>
+                                <span class="detail-label">failed</span>
+                            </div>
+                            <div class="action-detail profit">
+                                <span class="detail-value" id="sandwich-profit">0.000</span>
+                                <span class="detail-label">ETH</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="action-bar">
+                        <div class="action-bar-fill" id="sandwich-bar"></div>
+                    </div>
+                </div>
+
+                <!-- Liquidation -->
+                <div class="action-card liquidation">
+                    <div class="action-header">
+                        <span class="action-icon">💧</span>
+                        <span class="action-title">Liquidation</span>
+                    </div>
+                    <div class="action-stats">
+                        <div class="action-main">
+                            <span class="action-count" id="liquidation-count">0</span>
+                            <span class="action-label">executed</span>
+                        </div>
+                        <div class="action-details">
+                            <div class="action-detail">
+                                <span class="detail-value" id="liquidation-found">0</span>
+                                <span class="detail-label">found</span>
+                            </div>
+                            <div class="action-detail">
+                                <span class="detail-value" id="liquidation-failed">0</span>
+                                <span class="detail-label">failed</span>
+                            </div>
+                            <div class="action-detail profit">
+                                <span class="detail-value" id="liquidation-profit">0.000</span>
+                                <span class="detail-label">ETH</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="action-bar">
+                        <div class="action-bar-fill" id="liquidation-bar"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+        <div class="grid">
+            <!-- Collectors -->
+            <section class="card">
+                <h2>Collectors</h2>
+                <div class="collector-list">
+                    <div class="collector" id="collector-mempool">
+                        <span class="collector-dot"></span>
+                        <span class="collector-name">MempoolCollector</span>
+                        <span class="collector-status">Unknown</span>
+                    </div>
+                    <div class="collector" id="collector-block">
+                        <span class="collector-dot"></span>
+                        <span class="collector-name">BlockCollector</span>
+                        <span class="collector-status">Unknown</span>
+                    </div>
+                    <div class="collector" id="collector-swap">
+                        <span class="collector-dot"></span>
+                        <span class="collector-name">SwapEventCollector</span>
+                        <span class="collector-status">Unknown</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Strategies -->
+            <section class="card">
+                <h2>Strategies</h2>
+                <div class="strategy-list">
+                    <div class="strategy" id="strategy-arbitrage">
+                        <span class="strategy-dot"></span>
+                        <span class="strategy-name">ArbitrageStrategy</span>
+                        <span class="strategy-info">-</span>
+                    </div>
+                    <div class="strategy" id="strategy-sandwich">
+                        <span class="strategy-dot"></span>
+                        <span class="strategy-name">SandwichStrategy</span>
+                        <span class="strategy-info">-</span>
+                    </div>
+                    <div class="strategy" id="strategy-liquidation">
+                        <span class="strategy-dot"></span>
+                        <span class="strategy-name">LiquidationStrategy</span>
+                        <span class="strategy-info">-</span>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Wallet -->
+            <section class="card wallet-card">
+                <h2>Wallet</h2>
+                <div class="wallet-info">
+                    <div class="wallet-row">
+                        <span class="wallet-label">Executor</span>
+                        <span class="wallet-value mono" id="wallet-address">-</span>
+                    </div>
+                    <div class="wallet-row">
+                        <span class="wallet-label">Balance</span>
+                        <span class="wallet-value" id="wallet-balance">-</span>
+                    </div>
+                </div>
+            </section>
+        </div>
+
+        <!-- Log Viewer -->
+        <section class="card log-card">
+            <h2>Live Logs <span class="log-count" id="log-count">0 lines</span></h2>
+            <div class="log-viewer" id="log-viewer">
+                <div class="log-placeholder">Waiting for logs...</div>
+            </div>
+        </section>
+
+        <footer>
+            <span>Log file: /tmp/mev.log</span>
+            <span>Last updated: <span id="last-update">-</span></span>
+            <span>Auto-refresh: 2s</span>
+        </footer>
+    </div>
+
+    <script>
+        function updateStatus(status) {
+            const badge = document.getElementById('bot-status');
+            const text = badge.querySelector('.status-text');
+            badge.className = 'status-badge';
+
+            switch(status) {
+                case 'running':
+                    badge.classList.add('status-running');
+                    text.textContent = 'Running';
+                    break;
+                case 'stopped':
+                    badge.classList.add('status-stopped');
+                    text.textContent = 'Stopped';
+                    break;
+                case 'stale':
+                    badge.classList.add('status-stale');
+                    text.textContent = 'Stale';
+                    break;
+                case 'no_log_file':
+                    badge.classList.add('status-error');
+                    text.textContent = 'No Log File';
+                    break;
+                default:
+                    badge.classList.add('status-unknown');
+                    text.textContent = status || 'Unknown';
+            }
+        }
+
+        function updateCollector(id, status) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const statusEl = el.querySelector('.collector-status');
+            el.className = 'collector';
+
+            if (status === 'connected') {
+                el.classList.add('connected');
+                statusEl.textContent = 'Connected';
+            } else if (status === 'disconnected') {
+                el.classList.add('disconnected');
+                statusEl.textContent = 'Disconnected';
+            } else {
+                el.classList.add('unknown');
+                statusEl.textContent = 'Unknown';
+            }
+        }
+
+        function updateStrategy(id, data) {
+            const el = document.getElementById(id);
+            if (!el) return;
+            const info = el.querySelector('.strategy-info');
+            el.className = 'strategy';
+
+            if (data.active) {
+                el.classList.add('active');
+                if (id === 'strategy-arbitrage') {
+                    info.textContent = `${data.pairs} pairs`;
+                } else if (id === 'strategy-sandwich') {
+                    info.textContent = `${data.routers} routers`;
+                } else if (id === 'strategy-liquidation') {
+                    info.textContent = `${data.accounts} accounts`;
+                }
+            } else {
+                el.classList.add('inactive');
+                info.textContent = 'Inactive';
+            }
+        }
+
+        function formatNumber(num) {
+            if (num === null || num === undefined) return '-';
+            return num.toLocaleString();
+        }
+
+        function formatProfit(num) {
+            if (num === null || num === undefined) return '0.000';
+            return num.toFixed(3);
+        }
+
+        function updateActionCard(type, actions, opportunities, totalActions) {
+            const count = actions.count || 0;
+            const profit = actions.profit_eth || 0;
+            const found = opportunities.found || 0;
+            const failed = opportunities.failed || 0;
+
+            document.getElementById(`${type}-count`).textContent = count;
+            document.getElementById(`${type}-profit`).textContent = formatProfit(profit);
+            document.getElementById(`${type}-found`).textContent = found;
+            document.getElementById(`${type}-failed`).textContent = failed;
+
+            // Update bar width
+            const bar = document.getElementById(`${type}-bar`);
+            if (bar && totalActions > 0) {
+                const pct = (count / totalActions) * 100;
+                bar.style.width = `${pct}%`;
+            } else if (bar) {
+                bar.style.width = '0%';
+            }
+        }
+
+        function updateLogs(logs) {
+            const viewer = document.getElementById('log-viewer');
+            const countEl = document.getElementById('log-count');
+
+            if (!logs || logs.length === 0) {
+                viewer.innerHTML = '<div class="log-placeholder">Waiting for logs...</div>';
+                countEl.textContent = '0 lines';
+                return;
+            }
+
+            countEl.textContent = `${logs.length} lines`;
+
+            const html = logs.map(log => {
+                const levelClass = `log-${log.level}`;
+                return `<div class="log-line ${levelClass}">
+                    <span class="log-time">${log.time}</span>
+                    <span class="log-message">${escapeHtml(log.message)}</span>
+                </div>`;
+            }).join('');
+
+            viewer.innerHTML = html;
+            viewer.scrollTop = viewer.scrollHeight;
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            return div.innerHTML;
+        }
+
+        async function fetchStats() {
+            try {
+                const [statsRes, logsRes] = await Promise.all([
+                    fetch('/api/stats'),
+                    fetch('/api/logs')
+                ]);
+
+                const stats = await statsRes.json();
+                const logsData = await logsRes.json();
+
+                // Update status
+                updateStatus(stats.bot_status);
+
+                // Update top stats
+                document.getElementById('current-block').textContent = formatNumber(stats.current_block);
+                document.getElementById('base-fee').textContent = stats.base_fee_gwei !== null ? stats.base_fee_gwei : '-';
+                document.getElementById('events-processed').textContent = formatNumber(stats.events_processed);
+                document.getElementById('total-actions').textContent = formatNumber(stats.totals?.actions || 0);
+                document.getElementById('total-profit').textContent = formatProfit(stats.totals?.profit_eth || 0);
+
+                // Update action cards
+                const totalActions = stats.totals?.actions || 0;
+                updateActionCard('arb', stats.actions.arbitrage, stats.opportunities.arbitrage, totalActions);
+                updateActionCard('sandwich', stats.actions.sandwich, stats.opportunities.sandwich, totalActions);
+                updateActionCard('liquidation', stats.actions.liquidation, stats.opportunities.liquidation, totalActions);
+
+                // Update collectors
+                updateCollector('collector-mempool', stats.collectors.mempool.status);
+                updateCollector('collector-block', stats.collectors.block.status);
+                updateCollector('collector-swap', stats.collectors.swap_event.status);
+
+                // Update strategies
+                updateStrategy('strategy-arbitrage', stats.strategies.arbitrage);
+                updateStrategy('strategy-sandwich', stats.strategies.sandwich);
+                updateStrategy('strategy-liquidation', stats.strategies.liquidation);
+
+                // Update wallet
+                document.getElementById('wallet-address').textContent = stats.wallet.address || '-';
+                document.getElementById('wallet-balance').textContent = stats.wallet.balance ? `${stats.wallet.balance} ETH` : '-';
+
+                // Update last update time
+                if (stats.last_update) {
+                    const date = new Date(stats.last_update);
+                    document.getElementById('last-update').textContent = date.toLocaleTimeString();
+                }
+
+                // Update logs
+                updateLogs(logsData.logs);
+
+            } catch (error) {
+                console.error('Failed to fetch stats:', error);
+                updateStatus('error: ' + error.message);
+            }
+        }
+
+        // Initial fetch
+        fetchStats();
+
+        // Auto-refresh every 2 seconds
+        setInterval(fetchStats, 2000);
+    </script>
+</body>
+</html>
